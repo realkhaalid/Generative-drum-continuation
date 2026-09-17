@@ -32,6 +32,7 @@ SOURCE_DURATION_SECONDS = 210
 FREQUENCY_PATCH_SIZE = 32
 TIME_PATCH_SIZE = 8
 CLIP_DURATION_SECONDS = 5
+PAIR_DURATION_SECONDS = 10
 SUPPORTED_EXTENSIONS = {
     ".wav",
     ".flac"
@@ -376,114 +377,255 @@ def check_token_shapes(tokens):
     print("First batch shape:", tokens[0].shape)
     print("First token shape:", tokens[0, 0].shape)
 
-def split_audio_into_tokens(
+def find_audio_context_target_pairs(
     audio,
     sr,
-    clip_duration=CLIP_DURATION_SECONDS,
-    loudness_threshold=LOUDNESS_THRESHOLD_DB
+    clip_duration=CLIP_DURATION_SECONDS
 ):
     """
-    Splits audio into fixed-duration clips and converts
-    each clip into 2D STFT tokens.
+    Finds valid start positions for contiguous
+    context-target audio pairs.
     """
 
-    sub_sample_length = int(
+    clip_length = int(
         sr * clip_duration
     )
 
-    token_sequences = []
+    pair_length = (
+        clip_length * 2
+    )
 
-    total_sub_samples = 0
-    quiet_sub_samples = 0
+    pair_start_samples = []
 
     for start_sample in range(
         0,
-        len(audio),
-        sub_sample_length
+        len(audio) - pair_length + 1,
+        pair_length
     ):
-        end_sample = (
+        pair_start_samples.append(
             start_sample
-            + sub_sample_length
-        )
-
-        sub_sample = audio[
-            start_sample:end_sample
-        ]
-
-        # Ignore incomplete final clip.
-        if len(sub_sample) != sub_sample_length:
-            continue
-
-        total_sub_samples += 1
-
-        sub_sample = sub_sample.astype(
-            np.float32
-        )
-
-        loudness_db = calculate_loudness_db(
-            sub_sample
-        )
-
-        # Record quiet clips but do not discard them.
-        if loudness_db < loudness_threshold:
-            quiet_sub_samples += 1
-
-        real_tensor, imaginary_tensor = (
-            convert_to_stft_spectrogram(
-                sub_sample
-            )
-        )
-
-        if total_sub_samples == 1:
-            print("Sub-sample length:", len(sub_sample))
-            print("Sub-sample duration:", len(sub_sample) / sr)
-            print("Real STFT shape:", real_tensor.shape)
-            print("Imaginary STFT shape:", imaginary_tensor.shape)
-
-        tokens = (
-            convert_stft_to_2d_patch_tokens(
-                real_tensor,
-                imaginary_tensor
-            )
-        )
-
-        token_sequences.append(
-            tokens
         )
 
     statistics = {
-        "total_sub_samples": total_sub_samples,
-        "token_sequences": len(token_sequences),
-        "quiet_sub_samples": quiet_sub_samples
+        "total_pairs": len(
+            pair_start_samples
+        )
     }
 
-    return token_sequences, statistics
+    return (
+        pair_start_samples,
+        statistics
+    )
+
+def process_audio_context_target_pair(
+    audio,
+    sr,
+    clip_duration=CLIP_DURATION_SECONDS
+):
+    """
+    Splits a contiguous audio segment into a context
+    and target, then converts both into STFT tokens.
+    """
+
+    clip_length = int(
+        sr * clip_duration
+    )
+
+    required_length = (
+        clip_length * 2
+    )
+
+    if len(audio) != required_length:
+        raise ValueError(
+            f"Expected {required_length} samples, "
+            f"but received {len(audio)}."
+        )
+
+    context_audio = audio[
+        :clip_length
+    ]
+
+    target_audio = audio[
+        clip_length:
+    ]
+
+    context_real, context_imaginary = (
+        convert_to_stft_spectrogram(
+            context_audio
+        )
+    )
+
+    target_real, target_imaginary = (
+        convert_to_stft_spectrogram(
+            target_audio
+        )
+    )
+
+    context_tokens = (
+        convert_stft_to_2d_patch_tokens(
+            context_real,
+            context_imaginary
+        )
+    )
+
+    target_tokens = (
+        convert_stft_to_2d_patch_tokens(
+            target_real,
+            target_imaginary
+        )
+    )
+
+    return (
+        context_tokens,
+        target_tokens
+    )
 
 if __name__ == "__main__":
-    slakh_redux_drum_audio_files = find_drum_audio_files_slakh_redux(SLAKH2100_REDUX_16K_TRAIN)
-    print(f"Total Track foulders: {len(slakh_redux_drum_audio_files)}")
+
+    slakh_redux_drum_audio_files = (
+        find_drum_audio_files_slakh_redux(
+            SLAKH2100_REDUX_16K_TRAIN
+        )
+    )
+
+    print(
+        f"Total drum audio files: "
+        f"{len(slakh_redux_drum_audio_files)}"
+    )
+
     invalid_count = 0
     check_count = 0
+
     for drum_audio_file in slakh_redux_drum_audio_files:
+
         try:
-            audio, sr = load_and_validate_audio(drum_audio_file)
-            real_tensor, imaginary_tensor = convert_to_stft_spectrogram(audio)
-            token_sequences, statistics = split_audio_into_tokens(audio, sr)
+            audio, sr = load_and_validate_audio(
+                drum_audio_file
+            )
+
+            pair_start_samples, statistics = (
+                find_audio_context_target_pairs(
+                    audio,
+                    sr
+                )
+            )
+
+            if len(pair_start_samples) == 0:
+                raise ValueError(
+                    "No complete context-target pairs "
+                    "were found."
+                )
+
+            # Only inspect the first 5 files.
             if check_count < 5:
-                print(f"file: {drum_audio_file.name}")
-                print(f"sample rate: {sr}")
-                print(f"file original length: {len(audio) / sr}")
-                check_stft_tensor_shapes(real_tensor, imaginary_tensor)
-                print(f"Audio Processing Stats: {statistics}")
-                check_token_shapes(token_sequences[check_count])
-                print("=" * 60)
+
+                start_sample = (
+                    pair_start_samples[0]
+                )
+
+                clip_length = int(
+                    sr
+                    * CLIP_DURATION_SECONDS
+                )
+
+                pair_length = (
+                    clip_length * 2
+                )
+
+                end_sample = (
+                    start_sample
+                    + pair_length
+                )
+
+                audio_pair = audio[
+                    start_sample:end_sample
+                ]
+
+                context_tokens, target_tokens = (
+                    process_audio_context_target_pair(
+                        audio_pair,
+                        sr
+                    )
+                )
+
+                print(
+                    f"file: "
+                    f"{drum_audio_file.name}"
+                )
+
+                print(
+                    f"sample rate: "
+                    f"{sr}"
+                )
+
+                print(
+                    f"file original length: "
+                    f"{len(audio) / sr}"
+                )
+
+                print(
+                    f"Audio Processing Stats: "
+                    f"{statistics}"
+                )
+
+                print(
+                    f"Pair start samples amount: "
+                    f"{len(pair_start_samples)}"
+                )
+
+                print(
+                    f"Example pair start sample: "
+                    f"{start_sample}"
+                )
+
+                print(
+                    f"Pair duration: "
+                    f"{len(audio_pair) / sr}"
+                )
+
+                print(
+                    "\nContext tokens:"
+                )
+
+                check_token_shapes(
+                    context_tokens
+                )
+
+                print(
+                    "\nTarget tokens:"
+                )
+
+                check_token_shapes(
+                    target_tokens
+                )
+
+                print(
+                    "=" * 60
+                )
+
                 check_count += 1
-            
+
         except ValueError as error:
-            print(f"Invalid file: {drum_audio_file.name}")
-            print(f"Reason: {error}")
+
+            print(
+                f"Invalid file: "
+                f"{drum_audio_file.name}"
+            )
+
+            print(
+                f"Reason: {error}"
+            )
+
             invalid_count += 1
+
             continue
 
-    print(f"Invalid file count: {invalid_count}")
-    print(f"Total viable audio files: {len(slakh_redux_drum_audio_files) - invalid_count}")
+    print(
+        f"Invalid file count: "
+        f"{invalid_count}"
+    )
+
+    print(
+        f"Total viable audio files: "
+        f"{len(slakh_redux_drum_audio_files) - invalid_count}"
+    )
