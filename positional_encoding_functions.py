@@ -52,92 +52,70 @@ def positional_encoding(
 
     return pos_encoding
 
-def frequency_time_positional_encoding(
-    n_frequency_patches,
-    n_time_patches,
-    embedding_dim,
-    device,
-    dtype
-):
-    """
-    Creates 2D sinusoidal positional encoding
-    for frequency-time STFT tokens.
-    """
-
-    frequency_encoding = positional_encoding(
-        n_frequency_patches,
-        embedding_dim,
-        device,
-        dtype
-    )
-
-    time_encoding = positional_encoding(
-        n_time_patches,
-        embedding_dim,
-        device,
-        dtype
-    )
-
-    positional_encodings = []
-
-    for frequency_index in range(
-        n_frequency_patches
-    ):
-        for time_index in range(
-            n_time_patches
-        ):
-
-            encoding = (
-                frequency_encoding[
-                    frequency_index
-                ]
-                +
-                time_encoding[
-                    time_index
-                ]
-            )
-
-            positional_encodings.append(
-                encoding
-            )
-
-    positional_encodings = torch.stack(
-        positional_encodings
-    )
-
-    return positional_encodings.unsqueeze(0)
-
-def add_positional_encoding(
+def add_sequence_positional_encoding(
     embeddings,
-    n_frequency_patches,
-    n_time_patches
+    n_frequency_patches
 ):
     """
-    Adds frequency and temporal positional
-    information to STFT token embeddings.
+    Adds continuous 2D time-frequency positional
+    encoding to an arbitrary-length token sequence.
     """
 
-    _, num_tokens, embedding_dim = (
+    _, sequence_length, embedding_dim = (
         embeddings.shape
     )
 
-    expected_tokens = (
-        n_frequency_patches
-        * n_time_patches
+    token_positions = torch.arange(
+        sequence_length,
+        device=embeddings.device
     )
 
-    if num_tokens != expected_tokens:
-        raise ValueError(
-            f"Expected {expected_tokens} tokens, "
-            f"but received {num_tokens}."
-        )
+    frequency_indices = (
+        token_positions
+        % n_frequency_patches
+    )
 
-    pos_encoding = frequency_time_positional_encoding(
+    time_indices = (
+        token_positions
+        // n_frequency_patches
+    )
+
+    n_time_positions = (
+        int(
+            time_indices.max().item()
+        )
+        + 1
+    )
+
+    frequency_encoding = positional_encoding(
         n_frequency_patches,
-        n_time_patches,
         embedding_dim,
         embeddings.device,
         embeddings.dtype
     )
 
-    return embeddings + pos_encoding
+    time_encoding = positional_encoding(
+        n_time_positions,
+        embedding_dim,
+        embeddings.device,
+        embeddings.dtype
+    )
+
+    pos_encoding = (
+        frequency_encoding[
+            frequency_indices
+        ]
+        +
+        time_encoding[
+            time_indices
+        ]
+    )
+
+    pos_encoding = (
+        pos_encoding.unsqueeze(0)
+    )
+
+    return (
+        embeddings
+        + pos_encoding
+    )

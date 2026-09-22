@@ -32,7 +32,8 @@ SOURCE_DURATION_SECONDS = 210
 FREQUENCY_PATCH_SIZE = 32
 TIME_PATCH_SIZE = 8
 CLIP_DURATION_SECONDS = 5
-PAIR_DURATION_SECONDS = 10
+STFT_MEAN = 4.466529783955559e-06
+STFT_STANDARD_DEVIATION = 0.6632796316820686
 SUPPORTED_EXTENSIONS = {
     ".wav",
     ".flac"
@@ -277,6 +278,23 @@ def check_stft_tensor_shapes(
     print("Real tensor dtype:", real_tensor.dtype)
     print("Imaginary tensor dtype:", imaginary_tensor.dtype)
 
+def normalize_stft(
+    stft_tensor,
+    mean=STFT_MEAN,
+    standard_deviation=STFT_STANDARD_DEVIATION
+):
+    """
+    Standardizes STFT values using statistics
+    calculated from the training dataset.
+    """
+
+    normalized_stft = (
+        stft_tensor
+        - mean
+    ) / standard_deviation
+
+    return normalized_stft
+
 def convert_stft_to_2d_patch_tokens(
     real_tensor,
     imaginary_tensor,
@@ -300,6 +318,10 @@ def convert_stft_to_2d_patch_tokens(
             imaginary_tensor
         ],
         dim=0
+    )
+
+    stft_tensor = normalize_stft(
+        stft_tensor
     )
 
     _, n_frequency_bins, n_time_frames = stft_tensor.shape
@@ -340,8 +362,8 @@ def convert_stft_to_2d_patch_tokens(
 
     # Permute index to return patches[0,1] as [n_frequency_patches, n_time_patches]
     patches = patches.permute(
-        1,
         3,
+        1,
         0,
         2,
         4
