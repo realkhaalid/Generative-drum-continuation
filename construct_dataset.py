@@ -35,11 +35,7 @@ SLAKH2100_REDUX_16K_VALIDATION = Path(
     "slakh2100_redux_16k/validation"
 )
 
-SLAKH2100_REDUX_16K_TEST = Path(
-    "C:/Uni/YearProject/datasets/"
-    "slakh2100_redux_16k/test"
-)
-
+# Dataset
 class DrumContinuationDataset(
     Dataset
 ):
@@ -52,6 +48,7 @@ class DrumContinuationDataset(
         drum_audio_files,
         dataset_source="unknown"
     ):
+
         self.samples = []
 
         self.dataset_source = (
@@ -64,13 +61,16 @@ class DrumContinuationDataset(
                     drum_audio_files
                 ),
 
-            "valid_source_files":
-                0,
-
             "invalid_source_files":
                 0,
 
             "total_pairs":
+                0,
+
+            "valid_pairs":
+                0,
+
+            "rejected_quiet_pairs":
                 0,
 
             "invalid_files":
@@ -87,7 +87,7 @@ class DrumContinuationDataset(
     ):
         """
         Scans source files and stores metadata
-        describing each context-target pair.
+        describing each valid context-target pair.
 
         STFTs and tokens are NOT stored here.
         """
@@ -118,15 +118,33 @@ class DrumContinuationDataset(
                     )
                 )
 
+                # Update pair statistics before checking whether any valid pairs remain.
+                self.processing_stats[
+                    "total_pairs"
+                ] += statistics[
+                    "total_pairs"
+                ]
+
+                self.processing_stats[
+                    "valid_pairs"
+                ] += statistics[
+                    "valid_pairs"
+                ]
+
+                self.processing_stats[
+                    "rejected_quiet_pairs"
+                ] += statistics[
+                    "rejected_quiet_pairs"
+                ]
+
+                # No usable pair exists in this file.
                 if len(
                     pair_start_samples
                 ) == 0:
 
-                    raise ValueError(
-                        "No complete context-target "
-                        "pairs were found."
-                    )
+                    continue
 
+                # Store only lightweight metadata.
                 for start_sample in (
                     pair_start_samples
                 ):
@@ -152,16 +170,6 @@ class DrumContinuationDataset(
                                 self.dataset_source
                         }
                     )
-
-                self.processing_stats[
-                    "total_pairs"
-                ] += statistics[
-                    "total_pairs"
-                ]
-
-                self.processing_stats[
-                    "valid_source_files"
-                ] += 1
 
             except (
                 ValueError,
@@ -267,6 +275,7 @@ class DrumContinuationDataset(
         if loaded_sample_rate != (
             sample_rate
         ):
+
             raise ValueError(
                 "Loaded sample rate does not "
                 "match expected sample rate."
@@ -277,9 +286,10 @@ class DrumContinuationDataset(
             dtype=np.float32
         )
 
-        if len(audio) != (
-            pair_length
-        ):
+        if len(
+            audio
+        ) != pair_length:
+
             raise ValueError(
                 f"Loaded context-target pair "
                 f"has incorrect length. "
@@ -297,10 +307,12 @@ class DrumContinuationDataset(
             )
         )
 
+        # Validate context tokens
         if not isinstance(
             context_tokens,
             torch.Tensor
         ):
+
             raise TypeError(
                 "Context tokens must be "
                 "a PyTorch tensor."
@@ -310,12 +322,14 @@ class DrumContinuationDataset(
             target_tokens,
             torch.Tensor
         ):
+
             raise TypeError(
                 "Target tokens must be "
                 "a PyTorch tensor."
             )
 
         if context_tokens.ndim != 3:
+
             raise ValueError(
                 "Expected context token shape "
                 "[1, number_of_tokens, "
@@ -324,6 +338,7 @@ class DrumContinuationDataset(
             )
 
         if target_tokens.ndim != 3:
+
             raise ValueError(
                 "Expected target token shape "
                 "[1, number_of_tokens, "
@@ -332,20 +347,25 @@ class DrumContinuationDataset(
             )
 
         if context_tokens.shape[0] != 1:
+
             raise ValueError(
                 "Context token batch "
                 "dimension must be 1."
             )
 
         if target_tokens.shape[0] != 1:
+
             raise ValueError(
                 "Target token batch "
                 "dimension must be 1."
             )
 
+        # Remove temporary batch dimension
         context_tokens = (
             context_tokens
-            .squeeze(0)
+            .squeeze(
+                0
+            )
             .to(
                 dtype=torch.float32
             )
@@ -353,7 +373,9 @@ class DrumContinuationDataset(
 
         target_tokens = (
             target_tokens
-            .squeeze(0)
+            .squeeze(
+                0
+            )
             .to(
                 dtype=torch.float32
             )
@@ -361,9 +383,9 @@ class DrumContinuationDataset(
 
         if (
             context_tokens.shape
-            !=
-            target_tokens.shape
+            != target_tokens.shape
         ):
+
             raise ValueError(
                 "Context and target token "
                 "shapes do not match. "
@@ -375,7 +397,6 @@ class DrumContinuationDataset(
             context_tokens,
             target_tokens
         )
-
 
     def return_processing_stats(
         self
@@ -403,16 +424,16 @@ class DrumContinuationDataset(
             ]
         )
 
+# Dataset creation
 def create_slakh_datasets(
     training_path,
     validation_path,
-    test_path,
     set_limit=SET_TRACK_LIMIT,
     maximum_tracks=MAXIMUM_TRACKS
 ):
     """
-    Creates lazy-loading Slakh training,
-    validation, and test datasets.
+    Creates lazy-loading Slakh training
+    and validation datasets.
     """
 
     training_files = (
@@ -439,18 +460,6 @@ def create_slakh_datasets(
         )
     )
 
-    test_files = (
-        find_drum_audio_files_slakh_redux(
-            test_path,
-            set_limit=(
-                set_limit
-            ),
-            maximum_tracks=(
-                maximum_tracks
-            )
-        )
-    )
-
     training_dataset = (
         DrumContinuationDataset(
             training_files,
@@ -465,19 +474,12 @@ def create_slakh_datasets(
         )
     )
 
-    test_dataset = (
-        DrumContinuationDataset(
-            test_files,
-            dataset_source="slakh"
-        )
-    )
-
     return (
         training_dataset,
-        validation_dataset,
-        test_dataset
+        validation_dataset
     )
 
+# Numerical dataset statistics
 def calculate_dataset_statistics(
     dataset
 ):
@@ -487,31 +489,47 @@ def calculate_dataset_statistics(
     in a dataset.
     """
 
-    if len(dataset) == 0:
+    if len(
+        dataset
+    ) == 0:
+
         raise ValueError(
             "Dataset contains no samples."
         )
 
     total_sum = 0.0
+
     total_squared_sum = 0.0
+
     total_values = 0
 
-    minimum_value = float("inf")
-    maximum_value = float("-inf")
+    minimum_value = float(
+        "inf"
+    )
+
+    maximum_value = float(
+        "-inf"
+    )
 
     for index in tqdm(
         range(
-            len(dataset)
+            len(
+                dataset
+            )
         ),
-        desc="Calculating dataset statistics"
+        desc=(
+            "Calculating dataset statistics"
+        )
     ):
 
         (
             context_tokens,
             target_tokens
-        ) = dataset[
-            index
-        ]
+        ) = (
+            dataset[
+                index
+            ]
+        )
 
         combined_tokens = torch.cat(
             [
@@ -571,7 +589,8 @@ def calculate_dataset_statistics(
     )
 
     standard_deviation = (
-        variance ** 0.5
+        variance
+        ** 0.5
     )
 
     statistics = {
@@ -595,38 +614,53 @@ def calculate_dataset_statistics(
 
 def calculate_normalized_value_ranges(
     dataset,
-    thresholds=(3.0, 6.0, 8.0, 12.0)
+    thresholds=(
+        3.0,
+        6.0,
+        8.0,
+        12.0
+    )
 ):
     """
     Calculates what percentage of normalized STFT
     values fall within a set of absolute thresholds.
     """
 
-    if len(dataset) == 0:
+    if len(
+        dataset
+    ) == 0:
+
         raise ValueError(
             "Dataset contains no samples."
         )
 
     threshold_counts = {
         threshold: 0
-        for threshold in thresholds
+        for threshold
+        in thresholds
     }
 
     total_values = 0
 
     for index in tqdm(
         range(
-            len(dataset)
+            len(
+                dataset
+            )
         ),
-        desc="Calculating normalized value ranges"
+        desc=(
+            "Calculating normalized value ranges"
+        )
     ):
 
         (
             context_tokens,
             target_tokens
-        ) = dataset[
-            index
-        ]
+        ) = (
+            dataset[
+                index
+            ]
+        )
 
         combined_tokens = torch.cat(
             [
@@ -644,7 +678,9 @@ def calculate_normalized_value_ranges(
             combined_tokens.numel()
         )
 
-        for threshold in thresholds:
+        for threshold in (
+            thresholds
+        ):
 
             threshold_counts[
                 threshold
@@ -659,7 +695,9 @@ def calculate_normalized_value_ranges(
 
     percentages = {}
 
-    for threshold in thresholds:
+    for threshold in (
+        thresholds
+    ):
 
         percentages[
             threshold
@@ -681,6 +719,7 @@ def calculate_normalized_value_ranges(
 
     return statistics
 
+# Dataset testing
 def check_dataset(
     dataset,
     dataset_name
@@ -690,26 +729,31 @@ def check_dataset(
     and lazily loads its first sample.
     """
 
-    print("\n")
-    print("=" * 60)
+    print(
+        "\n"
+    )
+
+    print(
+        "=" * 60
+    )
+
     print(
         f"{dataset_name} Dataset"
     )
-    print("=" * 60)
+
+    print(
+        "=" * 60
+    )
 
     stats = (
         dataset
         .return_processing_stats()
     )
 
+    # Processing statistics
     print(
         f"Source files: "
         f"{stats['source_files']}"
-    )
-
-    print(
-        f"Valid source files: "
-        f"{stats['valid_source_files']}"
     )
 
     print(
@@ -718,8 +762,18 @@ def check_dataset(
     )
 
     print(
-        f"Total context-target pairs: "
+        f"Total candidate pairs: "
         f"{stats['total_pairs']}"
+    )
+
+    print(
+        f"Valid pairs: "
+        f"{stats['valid_pairs']}"
+    )
+
+    print(
+        f"Rejected quiet pairs: "
+        f"{stats['rejected_quiet_pairs']}"
     )
 
     print(
@@ -727,6 +781,48 @@ def check_dataset(
         f"{len(dataset)}"
     )
 
+    # Retention/rejection percentages
+    if stats[
+        "total_pairs"
+    ] > 0:
+
+        rejection_percentage = (
+            stats[
+                "rejected_quiet_pairs"
+            ]
+            / stats[
+                "total_pairs"
+            ]
+            * 100.0
+        )
+
+        retention_percentage = (
+            stats[
+                "valid_pairs"
+            ]
+            / stats[
+                "total_pairs"
+            ]
+            * 100.0
+        )
+
+        print(
+            f"Quiet-pair rejection rate: "
+            f"{rejection_percentage:.2f}%"
+        )
+
+        print(
+            f"Pair retention rate: "
+            f"{retention_percentage:.2f}%"
+        )
+
+    # Sanity check
+    print(
+        f"Valid pairs match dataset length: "
+        f"{stats['valid_pairs'] == len(dataset)}"
+    )
+
+    # Invalid files
     if stats[
         "invalid_files"
     ]:
@@ -746,7 +842,9 @@ def check_dataset(
                 f"{invalid_file['reason']}"
             )
 
-    if len(dataset) == 0:
+    if len(
+        dataset
+    ) == 0:
 
         print(
             "Dataset contains no "
@@ -755,6 +853,7 @@ def check_dataset(
 
         return
 
+    # First sample metadata
     sample_metadata = (
         dataset
         .return_sample_metadata(
@@ -790,11 +889,15 @@ def check_dataset(
         f"{sample_metadata['dataset_source']}"
     )
 
-    # Trigger lazy loading.
+    # Trigger lazy loading
     (
         context_tokens,
         target_tokens
-    ) = dataset[0]
+    ) = (
+        dataset[
+            0
+        ]
+    )
 
     print(
         "\nFirst loaded sample"
@@ -859,6 +962,7 @@ def check_dataset(
         f"{context_tokens.shape == target_tokens.shape}"
     )
 
+
 def check_data_loader(
     data_loader,
     loader_name
@@ -868,12 +972,21 @@ def check_data_loader(
     a DataLoader.
     """
 
-    print("\n")
-    print("=" * 60)
+    print(
+        "\n"
+    )
+
+    print(
+        "=" * 60
+    )
+
     print(
         f"{loader_name} DataLoader"
     )
-    print("=" * 60)
+
+    print(
+        "=" * 60
+    )
 
     if len(
         data_loader.dataset
@@ -956,13 +1069,13 @@ def check_data_loader(
         f"{context_batch.shape == target_batch.shape}"
     )
 
+
 if __name__ == "__main__":
 
-    # Create datasets
+    # Create full training and validation datasets
     (
         training_dataset,
-        validation_dataset,
-        test_dataset
+        validation_dataset
     ) = (
         create_slakh_datasets(
             training_path=(
@@ -971,9 +1084,6 @@ if __name__ == "__main__":
             validation_path=(
                 SLAKH2100_REDUX_16K_VALIDATION
             ),
-            test_path=(
-                SLAKH2100_REDUX_16K_TEST
-            ),
             set_limit=(
                 SET_TRACK_LIMIT
             ),
@@ -981,6 +1091,97 @@ if __name__ == "__main__":
                 MAXIMUM_TRACKS
             )
         )
+    )
+
+    training_statistics = (
+        calculate_dataset_statistics(
+            training_dataset
+        )
+    )
+
+    print(
+        "\n"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        "Training Dataset Numerical Statistics"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        f"Mean: "
+        f"{training_statistics['mean']}"
+    )
+
+    print(
+        f"Standard deviation: "
+        f"{training_statistics['standard_deviation']}"
+    )
+
+    print(
+        f"Minimum: "
+        f"{training_statistics['minimum']}"
+    )
+
+    print(
+        f"Maximum: "
+        f"{training_statistics['maximum']}"
+    )
+
+    print(
+        f"Total values: "
+        f"{training_statistics['total_values']}"
+    )
+
+    range_statistics = (
+        calculate_normalized_value_ranges(
+            training_dataset,
+            thresholds=(
+                3.0,
+                6.0,
+                8.0,
+                12.0
+            )
+        )
+    )
+
+    print(
+        "\n"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        "Normalized STFT Value Distribution"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    for threshold, percentage in (
+        range_statistics[
+            "percentages"
+        ].items()
+    ):
+
+        print(
+            f"Within ±{threshold}: "
+            f"{percentage:.6f}%"
+        )
+
+    print(
+        f"Total values checked: "
+        f"{range_statistics['total_values']}"
     )
 
     # Check datasets
@@ -994,85 +1195,13 @@ if __name__ == "__main__":
         "Validation"
     )
 
-    check_dataset(
-        test_dataset,
-        "Test"
-    )
-
-    # training_statistics = (
-    #     calculate_dataset_statistics(
-    #         training_dataset
-    #     )
-    # )
-
-    # print("\n")
-    # print("=" * 60)
-    # print("Training Dataset Numerical Statistics")
-    # print("=" * 60)
-
-    # print(
-    #     f"Mean: "
-    #     f"{training_statistics['mean']}"
-    # )
-
-    # print(
-    #     f"Standard deviation: "
-    #     f"{training_statistics['standard_deviation']}"
-    # )
-
-    # print(
-    #     f"Minimum: "
-    #     f"{training_statistics['minimum']}"
-    # )
-
-    # print(
-    #     f"Maximum: "
-    #     f"{training_statistics['maximum']}"
-    # )
-
-    # print(
-    #     f"Total values: "
-    #     f"{training_statistics['total_values']}"
-    # )
-
-    # range_statistics = (
-    #     calculate_normalized_value_ranges(
-    #         training_dataset,
-    #         thresholds=(
-    #             3.0,
-    #             6.0,
-    #             8.0,
-    #             12.0
-    #         )
-    #     )
-    # )
-
-    # print("\n")
-    # print("=" * 60)
-    # print("Normalized STFT Value Distribution")
-    # print("=" * 60)
-
-    # for threshold, percentage in (
-    #     range_statistics[
-    #         "percentages"
-    #     ].items()
-    # ):
-
-    #     print(
-    #         f"Within ±{threshold}: "
-    #         f"{percentage:.6f}%"
-    #     )
-
-    # print(
-    #     f"Total values checked: "
-    #     f"{range_statistics['total_values']}"
-    # )
-
     # Create DataLoaders
     training_loader = (
         DataLoader(
             training_dataset,
-            batch_size=BATCH_SIZE,
+            batch_size=(
+                BATCH_SIZE
+            ),
             shuffle=True
         )
     )
@@ -1080,15 +1209,9 @@ if __name__ == "__main__":
     validation_loader = (
         DataLoader(
             validation_dataset,
-            batch_size=BATCH_SIZE,
-            shuffle=False
-        )
-    )
-
-    test_loader = (
-        DataLoader(
-            test_dataset,
-            batch_size=BATCH_SIZE,
+            batch_size=(
+                BATCH_SIZE
+            ),
             shuffle=False
         )
     )
@@ -1102,9 +1225,4 @@ if __name__ == "__main__":
     check_data_loader(
         validation_loader,
         "Validation"
-    )
-
-    check_data_loader(
-        test_loader,
-        "Test"
     )

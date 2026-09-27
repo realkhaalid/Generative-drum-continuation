@@ -1,11 +1,10 @@
 import librosa as lib
 import numpy as np
+import soundfile as sf
 import torch
-import matplotlib.pyplot as plt
 import warnings
 from pathlib import Path
 import yaml
-from pathlib import Path
 
 #ignore librosa warnings
 warnings.filterwarnings(
@@ -30,10 +29,10 @@ LOUDNESS_THRESHOLD_DB = -55.0
 TARGET_SAMPLE_RATE = 16000
 SOURCE_DURATION_SECONDS = 210
 FREQUENCY_PATCH_SIZE = 32
-TIME_PATCH_SIZE = 8
+TIME_PATCH_SIZE = 2
 CLIP_DURATION_SECONDS = 5
-STFT_MEAN = 4.466529783955559e-06
-STFT_STANDARD_DEVIATION = 0.6632796316820686
+STFT_MEAN = 5.276912607275815e-06
+STFT_STANDARD_DEVIATION = 0.7016274969136407
 SUPPORTED_EXTENSIONS = {
     ".wav",
     ".flac"
@@ -388,6 +387,192 @@ def convert_stft_to_2d_patch_tokens(
 
     return tokens
 
+def denormalize_stft(
+    normalized_stft,
+    mean=STFT_MEAN,
+    standard_deviation=STFT_STANDARD_DEVIATION
+):
+
+    stft_tensor = (
+        normalized_stft
+        * standard_deviation
+    ) + mean
+
+    return stft_tensor
+
+def convert_2d_patch_tokens_to_stft(
+    tokens,
+    n_frequency_patches=16,
+    frequency_patch_size=FREQUENCY_PATCH_SIZE,
+    time_patch_size=TIME_PATCH_SIZE
+):
+    """
+    Converts 2D STFT patch tokens back into
+    real and imaginary STFT tensors.
+    """
+
+    if tokens.ndim != 2:
+
+        raise ValueError(
+            "Expected tokens with shape "
+            "[number_of_tokens, token_dimension]."
+        )
+
+    number_of_tokens = (
+        tokens.shape[0]
+    )
+
+    expected_token_dimension = (
+        2
+        * frequency_patch_size
+        * time_patch_size
+    )
+
+    if (
+        tokens.shape[1]
+        != expected_token_dimension
+    ):
+
+        raise ValueError(
+            "Token dimension does not match "
+            "the configured STFT patch size."
+        )
+
+    if (
+        number_of_tokens
+        % n_frequency_patches
+        != 0
+    ):
+
+        raise ValueError(
+            "Number of tokens must be divisible "
+            "by the number of frequency patches."
+        )
+
+    n_time_patches = (
+        number_of_tokens
+        // n_frequency_patches
+    )
+
+    # Reverse flattened token representation.
+    patches = tokens.reshape(
+        n_time_patches,
+        n_frequency_patches,
+        2,
+        frequency_patch_size,
+        time_patch_size
+    )
+
+    # Reverse the permutation performed during tokenization.
+    patches = patches.permute(
+        2,
+        1,
+        3,
+        0,
+        4
+    )
+
+    # [2, frequency_bins, time_frames]
+    stft_tensor = patches.reshape(
+        2,
+        n_frequency_patches
+        * frequency_patch_size,
+        n_time_patches
+        * time_patch_size
+    )
+
+    # Restore original STFT scale.
+    stft_tensor = (
+        denormalize_stft(
+            stft_tensor
+        )
+    )
+
+    real_tensor = (
+        stft_tensor[0]
+    )
+
+    imaginary_tensor = (
+        stft_tensor[1]
+    )
+
+    return (
+        real_tensor,
+        imaginary_tensor
+    )
+
+def reconstruct_audio_from_stft_tokens(
+    tokens,
+    sample_rate=TARGET_SAMPLE_RATE
+):
+    """
+    Reconstructs waveform audio from generated
+    normalized STFT patch tokens.
+    """
+
+    (
+        real_tensor,
+        imaginary_tensor
+    ) = (
+        convert_2d_patch_tokens_to_stft(
+            tokens
+        )
+    )
+
+    real = (
+        real_tensor
+        .detach()
+        .cpu()
+        .numpy()
+    )
+
+    imaginary = (
+        imaginary_tensor
+        .detach()
+        .cpu()
+        .numpy()
+    )
+
+    complex_stft = (
+        real
+        + (
+            1j
+            * imaginary
+        )
+    )
+
+    # Tokenization currently retains:
+    padded_stft = np.zeros(
+        (
+            513,
+            157
+        ),
+        dtype=np.complex64
+    )
+
+    padded_stft[
+        :complex_stft.shape[0],
+        :complex_stft.shape[1]
+    ] = (
+        complex_stft
+    )
+
+    audio = lib.istft(
+        padded_stft,
+        hop_length=HOPLENGTH,
+        length=(
+            sample_rate
+            * CLIP_DURATION_SECONDS
+        )
+    )
+
+    audio = np.asarray(
+        audio,
+        dtype=np.float32
+    )
+
+    return audio
+
 def check_token_shapes(tokens):
 
     print("Tokens type:", type(tokens))
@@ -402,36 +587,104 @@ def check_token_shapes(tokens):
 def find_audio_context_target_pairs(
     audio,
     sr,
-    clip_duration=CLIP_DURATION_SECONDS
+    clip_duration=CLIP_DURATION_SECONDS,
+    loudness_threshold_db=LOUDNESS_THRESHOLD_DB
 ):
     """
-    Finds valid start positions for contiguous
-    context-target audio pairs.
+    Finds valid contiguous context-target pairs
+    containing audible audio in both clips.
     """
 
     clip_length = int(
-        sr * clip_duration
+        sr
+        * clip_duration
     )
 
     pair_length = (
-        clip_length * 2
+        clip_length
+        * 2
     )
 
     pair_start_samples = []
+
+    total_pairs = 0
+
+    rejected_quiet_pairs = 0
 
     for start_sample in range(
         0,
         len(audio) - pair_length + 1,
         pair_length
     ):
+
+        total_pairs += 1
+
+        context_start = (
+            start_sample
+        )
+
+        context_end = (
+            context_start
+            + clip_length
+        )
+
+        target_start = (
+            context_end
+        )
+
+        target_end = (
+            target_start
+            + clip_length
+        )
+
+        context_audio = audio[
+            context_start:
+            context_end
+        ]
+
+        target_audio = audio[
+            target_start:
+            target_end
+        ]
+
+        context_loudness_db = (
+            calculate_loudness_db(
+                context_audio
+            )
+        )
+
+        target_loudness_db = (
+            calculate_loudness_db(
+                target_audio
+            )
+        )
+
+        if (
+            context_loudness_db
+            < loudness_threshold_db
+            or target_loudness_db
+            < loudness_threshold_db
+        ):
+
+            rejected_quiet_pairs += 1
+
+            continue
+
         pair_start_samples.append(
             start_sample
         )
 
     statistics = {
-        "total_pairs": len(
-            pair_start_samples
-        )
+        "total_pairs":
+            total_pairs,
+
+        "valid_pairs":
+            len(
+                pair_start_samples
+            ),
+
+        "rejected_quiet_pairs":
+            rejected_quiet_pairs
     }
 
     return (
@@ -504,54 +757,107 @@ def process_audio_context_target_pair(
 
 if __name__ == "__main__":
 
+    # Reconstruction testing configuration
+    NUMBER_OF_TEST_EXAMPLES = 5
+
+    reconstruction_output_directory = Path(
+        "reconstruction_tests"
+    )
+
+    reconstruction_output_directory.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    # Find training drum audio files
     slakh_redux_drum_audio_files = (
         find_drum_audio_files_slakh_redux(
-            SLAKH2100_REDUX_16K_TRAIN
+            SLAKH2100_REDUX_16K_TRAIN,
+            set_limit=True,
+            maximum_tracks=2
         )
     )
 
     print(
-        f"Total drum audio files: "
-        f"{len(slakh_redux_drum_audio_files)}"
+        "\n"
+        + "=" * 70
     )
 
-    invalid_count = 0
-    check_count = 0
+    print(
+        "STFT TOKEN RECONSTRUCTION TEST"
+    )
 
-    for drum_audio_file in slakh_redux_drum_audio_files:
+    print(
+        "=" * 70
+    )
+
+    print(
+        "\nTraining drum files found:",
+        len(
+            slakh_redux_drum_audio_files
+        )
+    )
+
+    example_count = 0
+
+    invalid_file_count = 0
+
+    # Search through training files for valid examples
+    for drum_audio_file in (
+        slakh_redux_drum_audio_files
+    ):
+
+        if (
+            example_count
+            >= NUMBER_OF_TEST_EXAMPLES
+        ):
+
+            break
 
         try:
-            audio, sr = load_and_validate_audio(
-                drum_audio_file
+
+            audio, sample_rate = (
+                load_and_validate_audio(
+                    drum_audio_file
+                )
             )
 
-            pair_start_samples, statistics = (
+            (
+                pair_start_samples,
+                statistics
+            ) = (
                 find_audio_context_target_pairs(
                     audio,
-                    sr
+                    sample_rate
                 )
             )
 
-            if len(pair_start_samples) == 0:
-                raise ValueError(
-                    "No complete context-target pairs "
-                    "were found."
-                )
+            if len(
+                pair_start_samples
+            ) == 0:
 
-            # Only inspect the first 5 files.
-            if check_count < 5:
+                continue
 
-                start_sample = (
-                    pair_start_samples[0]
-                )
+            # Test valid pairs from this file
+            for start_sample in (
+                pair_start_samples
+            ):
+
+                if (
+                    example_count
+                    >= NUMBER_OF_TEST_EXAMPLES
+                ):
+
+                    break
 
                 clip_length = int(
-                    sr
+                    sample_rate
                     * CLIP_DURATION_SECONDS
                 )
 
                 pair_length = (
-                    clip_length * 2
+                    clip_length
+                    * 2
                 )
 
                 end_sample = (
@@ -560,94 +866,348 @@ if __name__ == "__main__":
                 )
 
                 audio_pair = audio[
-                    start_sample:end_sample
+                    start_sample:
+                    end_sample
                 ]
 
-                context_tokens, target_tokens = (
+                # Original waveform sections
+                original_context_audio = (
+                    audio_pair[
+                        :clip_length
+                    ]
+                )
+
+                original_target_audio = (
+                    audio_pair[
+                        clip_length:
+                    ]
+                )
+
+                # Convert original pair into model tokens
+                (
+                    context_tokens,
+                    target_tokens
+                ) = (
                     process_audio_context_target_pair(
                         audio_pair,
-                        sr
+                        sample_rate
                     )
                 )
 
+                # Remove temporary batch dimension.
+                context_tokens = (
+                    context_tokens.squeeze(
+                        0
+                    )
+                )
+
+                target_tokens = (
+                    target_tokens.squeeze(
+                        0
+                    )
+                )
+
+                # Reconstruct waveform from tokens
+                reconstructed_context_audio = (
+                    reconstruct_audio_from_stft_tokens(
+                        context_tokens,
+                        sample_rate=(
+                            sample_rate
+                        )
+                    )
+                )
+
+                reconstructed_target_audio = (
+                    reconstruct_audio_from_stft_tokens(
+                        target_tokens,
+                        sample_rate=(
+                            sample_rate
+                        )
+                    )
+                )
+
+                # Create output directory for example
+                example_number = (
+                    example_count
+                    + 1
+                )
+
+                example_directory = (
+                    reconstruction_output_directory
+                    / (
+                        f"example_"
+                        f"{example_number}"
+                    )
+                )
+
+                example_directory.mkdir(
+                    parents=True,
+                    exist_ok=True
+                )
+
+                # Save original audio
+                sf.write(
+                    example_directory
+                    / "original_context.wav",
+                    original_context_audio,
+                    sample_rate,
+                    subtype="FLOAT"
+                )
+
+                sf.write(
+                    example_directory
+                    / "original_target.wav",
+                    original_target_audio,
+                    sample_rate,
+                    subtype="FLOAT"
+                )
+
+                # Save reconstructed audio
+                sf.write(
+                    example_directory
+                    / "reconstructed_context.wav",
+                    reconstructed_context_audio,
+                    sample_rate,
+                    subtype="FLOAT"
+                )
+
+                sf.write(
+                    example_directory
+                    / "reconstructed_target.wav",
+                    reconstructed_target_audio,
+                    sample_rate,
+                    subtype="FLOAT"
+                )
+
+                # Numerical checks
+                context_mse = np.mean(
+                    (
+                        original_context_audio
+                        - reconstructed_context_audio
+                    ) ** 2
+                )
+
+                target_mse = np.mean(
+                    (
+                        original_target_audio
+                        - reconstructed_target_audio
+                    ) ** 2
+                )
+
+                context_mae = np.mean(
+                    np.abs(
+                        original_context_audio
+                        - reconstructed_context_audio
+                    )
+                )
+
+                target_mae = np.mean(
+                    np.abs(
+                        original_target_audio
+                        - reconstructed_target_audio
+                    )
+                )
+
+                context_original_loudness = (
+                    calculate_loudness_db(
+                        original_context_audio
+                    )
+                )
+
+                context_reconstructed_loudness = (
+                    calculate_loudness_db(
+                        reconstructed_context_audio
+                    )
+                )
+
+                target_original_loudness = (
+                    calculate_loudness_db(
+                        original_target_audio
+                    )
+                )
+
+                target_reconstructed_loudness = (
+                    calculate_loudness_db(
+                        reconstructed_target_audio
+                    )
+                )
+
+                # Print example information
                 print(
-                    f"file: "
-                    f"{drum_audio_file.name}"
+                    "\n"
+                    + "=" * 70
                 )
 
                 print(
-                    f"sample rate: "
-                    f"{sr}"
+                    f"EXAMPLE "
+                    f"{example_number}"
                 )
 
                 print(
-                    f"file original length: "
-                    f"{len(audio) / sr}"
+                    "=" * 70
                 )
 
                 print(
-                    f"Audio Processing Stats: "
-                    f"{statistics}"
+                    "Audio file:",
+                    drum_audio_file
                 )
 
                 print(
-                    f"Pair start samples amount: "
-                    f"{len(pair_start_samples)}"
+                    "Pair start time:",
+                    (
+                        start_sample
+                        / sample_rate
+                    ),
+                    "seconds"
                 )
 
                 print(
-                    f"Example pair start sample: "
-                    f"{start_sample}"
+                    "\nToken shapes"
                 )
 
                 print(
-                    f"Pair duration: "
-                    f"{len(audio_pair) / sr}"
+                    "Context:",
+                    context_tokens.shape
                 )
 
                 print(
-                    "\nContext tokens:"
-                )
-
-                check_token_shapes(
-                    context_tokens
+                    "Target:",
+                    target_tokens.shape
                 )
 
                 print(
-                    "\nTarget tokens:"
-                )
-
-                check_token_shapes(
-                    target_tokens
+                    "\nOriginal waveform ranges"
                 )
 
                 print(
-                    "=" * 60
+                    "Context min/max:",
+                    original_context_audio.min(),
+                    original_context_audio.max()
                 )
 
-                check_count += 1
+                print(
+                    "Target min/max:",
+                    original_target_audio.min(),
+                    original_target_audio.max()
+                )
 
-        except ValueError as error:
+                print(
+                    "\nReconstructed waveform ranges"
+                )
+
+                print(
+                    "Context min/max:",
+                    reconstructed_context_audio.min(),
+                    reconstructed_context_audio.max()
+                )
+
+                print(
+                    "Target min/max:",
+                    reconstructed_target_audio.min(),
+                    reconstructed_target_audio.max()
+                )
+
+                print(
+                    "\nLoudness"
+                )
+
+                print(
+                    "Original context:",
+                    f"{context_original_loudness:.2f} dB"
+                )
+
+                print(
+                    "Reconstructed context:",
+                    f"{context_reconstructed_loudness:.2f} dB"
+                )
+
+                print(
+                    "Original target:",
+                    f"{target_original_loudness:.2f} dB"
+                )
+
+                print(
+                    "Reconstructed target:",
+                    f"{target_reconstructed_loudness:.2f} dB"
+                )
+
+                print(
+                    "\nReconstruction error"
+                )
+
+                print(
+                    "Context MSE:",
+                    context_mse
+                )
+
+                print(
+                    "Context MAE:",
+                    context_mae
+                )
+
+                print(
+                    "Target MSE:",
+                    target_mse
+                )
+
+                print(
+                    "Target MAE:",
+                    target_mae
+                )
+
+                print(
+                    "\nSaved audio to:"
+                )
+
+                print(
+                    example_directory
+                )
+
+                example_count += 1
+
+        except (
+            ValueError,
+            TypeError,
+            OSError
+        ) as error:
 
             print(
-                f"Invalid file: "
-                f"{drum_audio_file.name}"
+                "\nInvalid file:",
+                drum_audio_file.name
             )
 
             print(
-                f"Reason: {error}"
+                "Reason:",
+                error
             )
 
-            invalid_count += 1
+            invalid_file_count += 1
 
-            continue
-
+    # Final summary
     print(
-        f"Invalid file count: "
-        f"{invalid_count}"
+        "\n"
+        + "=" * 70
     )
 
     print(
-        f"Total viable audio files: "
-        f"{len(slakh_redux_drum_audio_files) - invalid_count}"
+        "RECONSTRUCTION TEST SUMMARY"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        "Examples tested:",
+        example_count
+    )
+
+    print(
+        "Invalid files:",
+        invalid_file_count
+    )
+
+    print(
+        "Output directory:",
+        reconstruction_output_directory
     )

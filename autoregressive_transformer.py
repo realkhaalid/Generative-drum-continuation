@@ -206,14 +206,104 @@ class AutoregressiveDrumTransformer(
 
         return predictions
 
+    def generate_continuation(
+        self,
+        context_tokens,
+        number_of_target_tokens
+    ):
+        """
+        Autoregressively generates target tokens
+        from a context sequence.
+        """
+
+        self.eval()
+
+        if context_tokens.ndim == 2:
+
+            context_tokens = (
+                context_tokens.unsqueeze(
+                    0
+                )
+            )
+
+        if context_tokens.ndim != 3:
+
+            raise ValueError(
+                "Context tokens must have shape "
+                "[sequence, token] or "
+                "[batch, sequence, token]."
+            )
+
+        if (
+            context_tokens.shape[2]
+            != self.token_dimension
+        ):
+
+            raise ValueError(
+                f"Expected token dimension "
+                f"{self.token_dimension}, "
+                f"but received "
+                f"{context_tokens.shape[2]}."
+            )
+
+        device = next(
+            self.parameters()
+        ).device
+
+        generated_sequence = (
+            context_tokens.to(
+                device=device,
+                dtype=torch.float32
+            )
+        )
+
+        with torch.no_grad():
+
+            for _ in range(
+                number_of_target_tokens
+            ):
+
+                predictions = (
+                    self(
+                        generated_sequence
+                    )
+                )
+
+                next_token = (
+                    predictions[
+                        :,
+                        -1:,
+                        :
+                    ]
+                )
+
+                generated_sequence = (
+                    torch.cat(
+                        [
+                            generated_sequence,
+                            next_token
+                        ],
+                        dim=1
+                    )
+                )
+
+        generated_target = (
+            generated_sequence[
+                :,
+                -number_of_target_tokens:,
+                :
+            ]
+        )
+
+        return generated_target
+
 if __name__ == "__main__":
 
     # Testing
     from construct_dataset import (
         create_slakh_datasets,
         SLAKH2100_REDUX_16K_TRAIN,
-        SLAKH2100_REDUX_16K_VALIDATION,
-        SLAKH2100_REDUX_16K_TEST
+        SLAKH2100_REDUX_16K_VALIDATION
     )
 
     SET_LIMIT = True
@@ -222,17 +312,13 @@ if __name__ == "__main__":
     # 1. Create datasets
     (
         training_dataset,
-        validation_dataset,
-        test_dataset
+        validation_dataset
     ) = create_slakh_datasets(
         training_path=(
             SLAKH2100_REDUX_16K_TRAIN
         ),
         validation_path=(
             SLAKH2100_REDUX_16K_VALIDATION
-        ),
-        test_path=(
-            SLAKH2100_REDUX_16K_TEST
         ),
         set_limit=SET_LIMIT,
         maximum_tracks=MAX_TRACKS
