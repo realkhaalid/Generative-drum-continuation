@@ -1,81 +1,126 @@
 import torch
-import copy
 
 from tqdm import tqdm
 from pathlib import Path
 from datetime import datetime
-from torch.utils.data import DataLoader
+from torch.utils.data import (
+    DataLoader,
+    Subset
+)
 
 import soundfile as sf
+
+from autoregressive_transformer import (
+    AutoregressiveDrumTransformer
+)
+
+from pretokenise_dataset import (
+    PretokenizedDrumDataset
+)
+
+from stft_tokeniser import (
+    STFTTokenizer
+)
 
 from data_processing_pipeline import (
     reconstruct_audio_from_stft_tokens,
     TARGET_SAMPLE_RATE
 )
 
-from autoregressive_transformer import (
-    AutoregressiveDrumTransformer
+
+# Dataset paths
+TRAINING_CONTEXT_PATH = (
+    "pretokenized_dataset_retrained/"
+    "training_context_tokens.npy"
 )
 
-from construct_dataset import (
-    create_slakh_datasets,
-    SLAKH2100_REDUX_16K_TRAIN,
-    SLAKH2100_REDUX_16K_VALIDATION
+TRAINING_TARGET_PATH = (
+    "pretokenized_dataset_retrained/"
+    "training_target_tokens.npy"
 )
 
-# Training configuration
-BATCH_SIZE = 16
-TOKEN_DIMENSION = 512
+VALIDATION_CONTEXT_PATH = (
+    "pretokenized_dataset_retrained/"
+    "validation_context_tokens.npy"
+)
+
+VALIDATION_TARGET_PATH = (
+    "pretokenized_dataset_retrained/"
+    "validation_target_tokens.npy"
+)
+
+TEST_CONTEXT_PATH = (
+    "pretokenized_dataset_retrained/"
+    "test_context_tokens.npy"
+)
+
+TEST_TARGET_PATH = (
+    "pretokenized_dataset_retrained/"
+    "test_target_tokens.npy"
+)
+
+# Tokenizer configuration
+TOKENIZER_CHECKPOINT_PATH = (
+    "tokenizer_checkpoints/"
+    "stft_tokenizer_2_retrained_best.pt"
+)
+
+# Transformer configuration
+CODEBOOK_SIZE = 1024
+NUMBER_OF_QUANTIZERS = 8
 EMBEDDING_DIMENSION = 256
 NUMBER_OF_HEADS = 8
 NUMBER_OF_LAYERS = 4
 FEED_FORWARD_DIMENSION = 1024
 DROPOUT = 0.1
 N_FREQUENCY_PATCHES = 16
+
+# Training configuration
+BATCH_SIZE = 8
 EPOCHS = 30
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
-SMOOTH_L1_BETA = 3.0
 GRADIENT_CLIP_NORM = 1.0
 PATIENCE = 10
-
 CHECKPOINT_INTERVAL = 5
+NUMBER_OF_GENERATION_EXAMPLES = 5
+
 CHECKPOINT_DIRECTORY = (
-    "checkpoints"
-)
-
-SET_LIMIT = False
-MAXIMUM_TRACKS = 1
-
-MODEL_NAME = (
-    "autoregressive_drum_transformer_MSE_Loss"
+    "transformer_checkpoints_retrained"
 )
 
 EXAMPLE_OUTPUT_DIRECTORY = (
-    "generated_examples"
+    "generated_examples_retrained"
 )
 
+MODEL_NAME = (
+    "autoregressive_drum_transformer_discrete_retrained"
+)
+
+SET_LIMIT = False
+MAXIMUM_TRAINING_EXAMPLES = 100
+MAXIMUM_VALIDATION_EXAMPLES = 50
+
+
+# Training Pipeline
 class TrainModelPipeline:
-    """
-    Trains the autoregressive drum continuation
-    Transformer.
-    """
 
     def __init__(
         self,
-        token_dimension=512,
-        embedding_dimension=256,
-        number_of_heads=8,
-        number_of_layers=4,
-        feed_forward_dimension=1024,
-        dropout=0.1,
-        n_frequency_patches=16,
-        smooth_l1_beta=3.0,
-        gradient_clip_norm=1.0,
-        weight_decay=1e-4,
-        checkpoint_interval=5,
-        checkpoint_directory="checkpoints",
-        example_output_directory="generated_examples",
+        tokenizer_checkpoint_path,
+        codebook_size=CODEBOOK_SIZE,
+        number_of_quantizers=NUMBER_OF_QUANTIZERS,
+        embedding_dimension=EMBEDDING_DIMENSION,
+        number_of_heads=NUMBER_OF_HEADS,
+        number_of_layers=NUMBER_OF_LAYERS,
+        feed_forward_dimension=FEED_FORWARD_DIMENSION,
+        dropout=DROPOUT,
+        n_frequency_patches=N_FREQUENCY_PATCHES,
+        gradient_clip_norm=GRADIENT_CLIP_NORM,
+        weight_decay=WEIGHT_DECAY,
+        checkpoint_interval=CHECKPOINT_INTERVAL,
+        checkpoint_directory=CHECKPOINT_DIRECTORY,
+        example_output_directory=EXAMPLE_OUTPUT_DIRECTORY,
         device=None
     ):
 
@@ -86,13 +131,6 @@ class TrainModelPipeline:
                 "be at least 1."
             )
 
-        if smooth_l1_beta <= 0:
-
-            raise ValueError(
-                "smooth_l1_beta must "
-                "be greater than 0."
-            )
-
         if gradient_clip_norm <= 0:
 
             raise ValueError(
@@ -100,8 +138,16 @@ class TrainModelPipeline:
                 "be greater than 0."
             )
 
-        self.token_dimension = (
-            token_dimension
+        self.tokenizer_checkpoint_path = Path(
+            tokenizer_checkpoint_path
+        )
+
+        self.codebook_size = (
+            codebook_size
+        )
+
+        self.number_of_quantizers = (
+            number_of_quantizers
         )
 
         self.embedding_dimension = (
@@ -126,10 +172,6 @@ class TrainModelPipeline:
 
         self.n_frequency_patches = (
             n_frequency_patches
-        )
-
-        self.smooth_l1_beta = (
-            smooth_l1_beta
         )
 
         self.gradient_clip_norm = (
@@ -176,17 +218,80 @@ class TrainModelPipeline:
                 device
             )
 
+        # Tokenizer is NOT used during training.
+        # It is loaded only so discrete token IDs
+        # can be decoded into audio examples.
+        self.tokenizer = (
+            self.load_tokenizer()
+        )
+
+    def load_tokenizer(
+        self
+    ):
+
+        tokenizer = (
+            STFTTokenizer()
+            .to(
+                self.device
+            )
+        )
+
+        checkpoint = torch.load(
+            self.tokenizer_checkpoint_path,
+            map_location=self.device,
+            weights_only=False
+        )
+
+        tokenizer.load_state_dict(
+            checkpoint[
+                "model_state_dict"
+            ]
+        )
+
+        tokenizer.eval()
+
+        for parameter in (
+            tokenizer.parameters()
+        ):
+
+            parameter.requires_grad = False
+
+        print(
+            "\nTokenizer loaded for "
+            "checkpoint reconstruction"
+        )
+
+        print(
+            "=" * 70
+        )
+
+        print(
+            "Checkpoint:",
+            self.tokenizer_checkpoint_path
+        )
+
+        print(
+            "Frozen:",
+            all(
+                not parameter.requires_grad
+                for parameter
+                in tokenizer.parameters()
+            )
+        )
+
+        return tokenizer
+
     def create_model(
         self
     ):
-        """
-        Creates a new autoregressive Transformer.
-        """
 
         model = (
             AutoregressiveDrumTransformer(
-                token_dimension=(
-                    self.token_dimension
+                codebook_size=(
+                    self.codebook_size
+                ),
+                number_of_quantizers=(
+                    self.number_of_quantizers
                 ),
                 embedding_dimension=(
                     self.embedding_dimension
@@ -217,92 +322,11 @@ class TrainModelPipeline:
 
         return model
 
-    def _copy_value(
-        self,
-        value
-    ):
-        """
-        Recursively creates detached CPU copies
-        of model-state values.
-        """
-
-        if isinstance(
-            value,
-            torch.Tensor
-        ):
-
-            return (
-                value
-                .detach()
-                .cpu()
-                .clone()
-            )
-
-        if isinstance(
-            value,
-            list
-        ):
-
-            return [
-                self._copy_value(
-                    item
-                )
-                for item in value
-            ]
-
-        if isinstance(
-            value,
-            tuple
-        ):
-
-            return tuple(
-                self._copy_value(
-                    item
-                )
-                for item in value
-            )
-
-        if isinstance(
-            value,
-            dict
-        ):
-
-            return {
-                key:
-                    self._copy_value(
-                        item
-                    )
-                for key, item
-                in value.items()
-            }
-
-        return copy.deepcopy(
-            value
-        )
-
-    def copy_model_state(
-        self,
-        model
-    ):
-        """
-        Returns an independent CPU copy of the
-        current model parameters.
-        """
-
-        return (
-            self._copy_value(
-                model.state_dict()
-            )
-        )
-
-    def _create_optimizer(
+    def create_optimizer(
         self,
         model,
         learning_rate
     ):
-        """
-        Creates the AdamW optimizer.
-        """
 
         optimizer = (
             torch.optim.AdamW(
@@ -316,73 +340,50 @@ class TrainModelPipeline:
 
         return optimizer
 
-    def _create_loss_function(
+    def create_loss_function(
         self
     ):
-        """
-        Creates the robust STFT regression loss.
-        """
 
-        loss_function = (
-            torch.nn.MSELoss()
+        return (
+            torch.nn.CrossEntropyLoss()
         )
-
-        return loss_function
 
     def prepare_autoregressive_batch(
         self,
-        context_batch,
-        target_batch
+        context_tokens,
+        target_tokens
     ):
-        """
-        Combines context and target into a full
-        sequence and shifts it for next-token
-        prediction.
-
-        Context:
-            [B, 304, 512]
-
-        Target:
-            [B, 304, 512]
-
-        Full sequence:
-            [B, 608, 512]
-
-        Model input:
-            [B, 607, 512]
-
-        Expected output:
-            [B, 607, 512]
-        """
 
         if (
-            context_batch.ndim != 3
-            or target_batch.ndim != 3
+            context_tokens.ndim != 3
+            or target_tokens.ndim != 3
         ):
 
             raise ValueError(
-                "Context and target must have "
-                "shape [batch, sequence, token]."
+                "Context and target must "
+                "have shape [B, S, Q]."
             )
 
         if (
-            context_batch.shape
-            != target_batch.shape
+            context_tokens.shape
+            != target_tokens.shape
         ):
 
             raise ValueError(
-                "Context and target batch "
-                "shapes must match."
+                "Context and target shapes "
+                "must match."
             )
 
         context_length = (
-            context_batch.shape[1]
+            context_tokens.shape[
+                1
+            ]
         )
 
         full_sequence = torch.cat(
             [
-                context_batch,
-                target_batch
+                context_tokens,
+                target_tokens
             ],
             dim=1
         )
@@ -411,27 +412,16 @@ class TrainModelPipeline:
 
     def select_target_continuation(
         self,
-        predictions,
+        logits,
         expected_output,
         context_length
     ):
-        """
-        Selects only the continuation section used
-        for loss calculation.
 
-        The first prediction is:
-
-            final context token -> first target token
-
-        Followed by:
-
-            target token -> next target token
-        """
-
-        target_predictions = (
-            predictions[
+        target_logits = (
+            logits[
                 :,
                 context_length - 1:,
+                :,
                 :
             ]
         )
@@ -444,179 +434,297 @@ class TrainModelPipeline:
             ]
         )
 
-        if (
-            target_predictions.shape
-            != target_expected.shape
-        ):
-
-            raise ValueError(
-                "Target predictions and expected "
-                "targets have different shapes."
-            )
-
         return (
-            target_predictions,
+            target_logits,
             target_expected
         )
 
-    def _save_checkpoint(
+    def calculate_loss(
         self,
-        model,
-        optimizer,
-        epoch,
-        model_name,
-        best_validation_loss,
-        best_epoch,
-        best_model_state,
-        checkpoint_type="latest"
+        target_logits,
+        target_expected,
+        loss_function
     ):
-        """
-        Saves a .pt checkpoint.
 
-        latest:
-            Saves current model and optimizer state
-            so training can be resumed.
+        quantizer_losses = []
 
-        best:
-            Saves the model with the lowest
-            validation loss.
-        """
-
-        if checkpoint_type not in (
-            "latest",
-            "best"
+        for quantizer_index in range(
+            self.number_of_quantizers
         ):
 
-            raise ValueError(
-                "checkpoint_type must be "
-                "'latest' or 'best'."
+            quantizer_logits = (
+                target_logits[
+                    :,
+                    :,
+                    quantizer_index,
+                    :
+                ]
             )
 
-        checkpoint = {
-            "model_name":
-                model_name,
+            quantizer_targets = (
+                target_expected[
+                    :,
+                    :,
+                    quantizer_index
+                ]
+            )
 
-            "checkpoint_type":
-                checkpoint_type,
-
-            "epoch":
-                epoch,
-
-            "model_state_dict":
-                self.copy_model_state(
-                    model
-                ),
-
-            "best_validation_loss":
-                best_validation_loss,
-
-            "best_epoch":
-                best_epoch,
-
-            "best_model_state_dict":
-                self._copy_value(
-                    best_model_state
-                ),
-
-            "model_configuration": {
-                "token_dimension":
-                    self.token_dimension,
-
-                "embedding_dimension":
-                    self.embedding_dimension,
-
-                "number_of_heads":
-                    self.number_of_heads,
-
-                "number_of_layers":
-                    self.number_of_layers,
-
-                "feed_forward_dimension":
-                    self.feed_forward_dimension,
-
-                "dropout":
-                    self.dropout,
-
-                "n_frequency_patches":
-                    self.n_frequency_patches
-            },
-
-            "training_configuration": {
-                "smooth_l1_beta":
-                    self.smooth_l1_beta,
-
-                "gradient_clip_norm":
-                    self.gradient_clip_norm,
-
-                "weight_decay":
-                    self.weight_decay
-            },
-
-            "saved_at":
-                datetime.now().isoformat(
-                    timespec="seconds"
-                )
-        }
-
-        if checkpoint_type == "latest":
-
-            checkpoint[
-                "optimizer_state_dict"
-            ] = (
-                self._copy_value(
-                    optimizer.state_dict()
+            quantizer_loss = (
+                loss_function(
+                    quantizer_logits.reshape(
+                        -1,
+                        self.codebook_size
+                    ),
+                    quantizer_targets.reshape(
+                        -1
+                    )
                 )
             )
 
-            file_name = (
-                f"{model_name}_latest.pt"
+            quantizer_losses.append(
+                quantizer_loss
             )
 
-        else:
-
-            file_name = (
-                f"{model_name}_best.pt"
-            )
-
-        file_path = (
-            self.checkpoint_directory
-            / file_name
-        )
-
-        temporary_path = (
-            file_path.with_suffix(
-                ".tmp"
+        quantizer_losses = (
+            torch.stack(
+                quantizer_losses
             )
         )
 
-        torch.save(
-            checkpoint,
-            temporary_path
+        total_loss = (
+            quantizer_losses.mean()
         )
 
-        temporary_path.replace(
-            file_path
+        return (
+            total_loss,
+            quantizer_losses
         )
 
-        return file_path
+    def calculate_accuracy(
+        self,
+        target_logits,
+        target_expected
+    ):
+
+        predicted_tokens = (
+            torch.argmax(
+                target_logits,
+                dim=-1
+            )
+        )
+
+        accuracy = (
+            (
+                predicted_tokens
+                == target_expected
+            )
+            .float()
+            .mean()
+            .item()
+        )
+
+        return accuracy
+
+    def decode_token_ids(
+        self,
+        token_ids
+    ):
+        """
+        Converts RVQ token IDs:
+
+            [S, Q]
+            or
+            [B, S, Q]
+
+        into reconstructed STFT patches:
+
+            [S, patch_dimension]
+        """
+
+        if token_ids.ndim == 2:
+
+            token_ids = (
+                token_ids.unsqueeze(
+                    0
+                )
+            )
+
+        token_ids = (
+            token_ids.to(
+                device=self.device,
+                dtype=torch.long
+            )
+        )
+
+        self.tokenizer.eval()
+
+        with torch.no_grad():
+
+            quantized_latents = (
+                self.tokenizer
+                .quantizer
+                .get_output_from_indices(
+                    token_ids
+                )
+            )
+
+            reconstructed_patches = (
+                self.tokenizer.decoder(
+                    quantized_latents
+                )
+            )
+
+        reconstructed_patches = (
+            reconstructed_patches[
+                0
+            ]
+            .detach()
+            .cpu()
+        )
+
+        return reconstructed_patches
+
+    def save_reference_examples(
+        self,
+        example_context_tokens,
+        example_target_tokens
+    ):
+
+        print(
+            "\nSaving reference examples"
+        )
+
+        print(
+            "=" * 70
+        )
+
+        for example_index in range(
+            len(
+                example_context_tokens
+            )
+        ):
+
+            context_token_ids = (
+                example_context_tokens[
+                    example_index
+                ]
+            )
+
+            target_token_ids = (
+                example_target_tokens[
+                    example_index
+                ]
+            )
+
+            context_patches = (
+                self.decode_token_ids(
+                    context_token_ids
+                )
+            )
+
+            target_patches = (
+                self.decode_token_ids(
+                    target_token_ids
+                )
+            )
+
+            context_audio = (
+                reconstruct_audio_from_stft_tokens(
+                    context_patches
+                )
+            )
+
+            target_audio = (
+                reconstruct_audio_from_stft_tokens(
+                    target_patches
+                )
+            )
+
+            context_path = (
+                self.example_output_directory
+                / (
+                    f"example_"
+                    f"{example_index + 1}_"
+                    f"context.wav"
+                )
+            )
+
+            target_path = (
+                self.example_output_directory
+                / (
+                    f"example_"
+                    f"{example_index + 1}_"
+                    f"target.wav"
+                )
+            )
+
+            sf.write(
+                context_path,
+                context_audio,
+                TARGET_SAMPLE_RATE
+            )
+
+            sf.write(
+                target_path,
+                target_audio,
+                TARGET_SAMPLE_RATE
+            )
+
+            print(
+                f"Example {example_index + 1}"
+            )
+
+            print(
+                "Context:",
+                context_path
+            )
+
+            print(
+                "Target:",
+                target_path
+            )
 
     def save_generated_example(
         self,
         model,
-        context_tokens,
+        context_token_ids,
         number_of_target_tokens,
         epoch,
-        model_name
+        model_name,
+        example_index
     ):
         """
-        Generates and saves an example drum
-        continuation for checkpoint evaluation.
+        Generates an autoregressive continuation,
+        decodes the generated RVQ IDs using the
+        frozen tokenizer and saves a WAV file.
         """
 
-        generated_tokens = (
+        model.eval()
+
+        context_token_ids = (
+            context_token_ids.to(
+                device=self.device,
+                dtype=torch.long
+            )
+        )
+
+        if context_token_ids.ndim == 2:
+
+            context_token_ids = (
+                context_token_ids.unsqueeze(
+                    0
+                )
+            )
+
+        print(
+            f"\nGenerating checkpoint example "
+            f"{example_index + 1}..."
+        )
+
+        generated_token_ids = (
             model.generate_continuation(
-                context_tokens=(
-                    context_tokens
+                context_token_ids=(
+                    context_token_ids
                 ),
                 number_of_target_tokens=(
                     number_of_target_tokens
@@ -624,24 +732,32 @@ class TrainModelPipeline:
             )
         )
 
-        generated_tokens = (
-            generated_tokens
-            .squeeze(
-                0
+        print(
+            "Generated token shape:",
+            generated_token_ids.shape
+        )
+
+        generated_patches = (
+            self.decode_token_ids(
+                generated_token_ids
             )
-            .detach()
-            .cpu()
+        )
+
+        print(
+            "Decoded STFT patch shape:",
+            generated_patches.shape
         )
 
         generated_audio = (
             reconstruct_audio_from_stft_tokens(
-                generated_tokens
+                generated_patches
             )
         )
 
         file_name = (
             f"{model_name}_"
             f"epoch_{epoch}_"
+            f"example_{example_index + 1}_"
             f"generated.wav"
         )
 
@@ -656,6 +772,11 @@ class TrainModelPipeline:
             TARGET_SAMPLE_RATE
         )
 
+        print(
+            "Generated example:",
+            file_path
+        )
+
         return file_path
 
     def train_epoch(
@@ -665,36 +786,44 @@ class TrainModelPipeline:
         optimizer,
         loss_function
     ):
-        """
-        Runs one autoregressive training epoch.
-        """
 
         model.train()
 
         total_loss = 0.0
 
+        total_accuracy = 0.0
+
+        quantizer_loss_totals = (
+            torch.zeros(
+                self.number_of_quantizers,
+                dtype=torch.float64
+            )
+        )
+
         number_of_batches = 0
 
         for (
-            context_batch,
-            target_batch
-        ) in data_loader:
+            context_tokens,
+            target_tokens
+        ) in tqdm(
+            data_loader,
+            desc="Training Transformer",
+            leave=False
+        ):
 
-            context_batch = (
-                context_batch.to(
+            context_tokens = (
+                context_tokens.to(
                     device=self.device,
-                    dtype=torch.float32
+                    dtype=torch.long
                 )
             )
 
-            target_batch = (
-                target_batch.to(
+            target_tokens = (
+                target_tokens.to(
                     device=self.device,
-                    dtype=torch.float32
+                    dtype=torch.long
                 )
             )
-
-            optimizer.zero_grad()
 
             (
                 model_input,
@@ -702,32 +831,38 @@ class TrainModelPipeline:
                 context_length
             ) = (
                 self.prepare_autoregressive_batch(
-                    context_batch,
-                    target_batch
+                    context_tokens,
+                    target_tokens
                 )
             )
 
-            predictions = (
+            optimizer.zero_grad()
+
+            logits = (
                 model(
                     model_input
                 )
             )
 
             (
-                target_predictions,
+                target_logits,
                 target_expected
             ) = (
                 self.select_target_continuation(
-                    predictions,
+                    logits,
                     expected_output,
                     context_length
                 )
             )
 
-            loss = (
-                loss_function(
-                    target_predictions,
-                    target_expected
+            (
+                loss,
+                quantizer_losses
+            ) = (
+                self.calculate_loss(
+                    target_logits,
+                    target_expected,
+                    loss_function
                 )
             )
 
@@ -751,25 +886,49 @@ class TrainModelPipeline:
 
             optimizer.step()
 
+            accuracy = (
+                self.calculate_accuracy(
+                    target_logits,
+                    target_expected
+                )
+            )
+
             total_loss += (
                 loss.item()
             )
 
-            number_of_batches += 1
-
-        if number_of_batches == 0:
-
-            raise ValueError(
-                "Training DataLoader "
-                "contains no batches."
+            total_accuracy += (
+                accuracy
             )
 
-        average_loss = (
-            total_loss
-            / number_of_batches
-        )
+            quantizer_loss_totals += (
+                quantizer_losses
+                .detach()
+                .cpu()
+                .to(
+                    torch.float64
+                )
+            )
 
-        return average_loss
+            number_of_batches += 1
+
+        results = {
+            "loss":
+                total_loss
+                / number_of_batches,
+
+            "accuracy":
+                total_accuracy
+                / number_of_batches,
+
+            "quantizer_losses":
+                (
+                    quantizer_loss_totals
+                    / number_of_batches
+                ).tolist()
+        }
+
+        return results
 
     def validate_epoch(
         self,
@@ -777,34 +936,44 @@ class TrainModelPipeline:
         data_loader,
         loss_function
     ):
-        """
-        Runs one autoregressive validation epoch.
-        """
 
         model.eval()
 
         total_loss = 0.0
+
+        total_accuracy = 0.0
+
+        quantizer_loss_totals = (
+            torch.zeros(
+                self.number_of_quantizers,
+                dtype=torch.float64
+            )
+        )
 
         number_of_batches = 0
 
         with torch.no_grad():
 
             for (
-                context_batch,
-                target_batch
-            ) in data_loader:
+                context_tokens,
+                target_tokens
+            ) in tqdm(
+                data_loader,
+                desc="Validating Transformer",
+                leave=False
+            ):
 
-                context_batch = (
-                    context_batch.to(
+                context_tokens = (
+                    context_tokens.to(
                         device=self.device,
-                        dtype=torch.float32
+                        dtype=torch.long
                     )
                 )
 
-                target_batch = (
-                    target_batch.to(
+                target_tokens = (
+                    target_tokens.to(
                         device=self.device,
-                        dtype=torch.float32
+                        dtype=torch.long
                     )
                 )
 
@@ -814,133 +983,261 @@ class TrainModelPipeline:
                     context_length
                 ) = (
                     self.prepare_autoregressive_batch(
-                        context_batch,
-                        target_batch
+                        context_tokens,
+                        target_tokens
                     )
                 )
 
-                predictions = (
+                logits = (
                     model(
                         model_input
                     )
                 )
 
                 (
-                    target_predictions,
+                    target_logits,
                     target_expected
                 ) = (
                     self.select_target_continuation(
-                        predictions,
+                        logits,
                         expected_output,
                         context_length
                     )
                 )
 
-                loss = (
-                    loss_function(
-                        target_predictions,
-                        target_expected
+                (
+                    loss,
+                    quantizer_losses
+                ) = (
+                    self.calculate_loss(
+                        target_logits,
+                        target_expected,
+                        loss_function
                     )
                 )
 
-                if not torch.isfinite(
-                    loss
-                ):
-
-                    raise ValueError(
-                        "Validation loss became "
-                        "NaN or infinite."
+                accuracy = (
+                    self.calculate_accuracy(
+                        target_logits,
+                        target_expected
                     )
+                )
 
                 total_loss += (
                     loss.item()
                 )
 
+                total_accuracy += (
+                    accuracy
+                )
+
+                quantizer_loss_totals += (
+                    quantizer_losses
+                    .detach()
+                    .cpu()
+                    .to(
+                        torch.float64
+                    )
+                )
+
                 number_of_batches += 1
 
-        if number_of_batches == 0:
+        results = {
+            "loss":
+                total_loss
+                / number_of_batches,
 
-            raise ValueError(
-                "Validation DataLoader "
-                "contains no batches."
+            "accuracy":
+                total_accuracy
+                / number_of_batches,
+
+            "quantizer_losses":
+                (
+                    quantizer_loss_totals
+                    / number_of_batches
+                ).tolist()
+        }
+
+        return results
+
+    def copy_model_state(
+        self,
+        model
+    ):
+
+        return {
+            key:
+                value
+                .detach()
+                .cpu()
+                .clone()
+            for key, value
+            in model.state_dict().items()
+        }
+
+    def save_checkpoint(
+        self,
+        model,
+        optimizer,
+        epoch,
+        model_name,
+        best_validation_loss,
+        best_epoch,
+        checkpoint_type
+    ):
+
+        checkpoint = {
+            "model_name":
+                model_name,
+
+            "checkpoint_type":
+                checkpoint_type,
+
+            "epoch":
+                epoch,
+
+            "model_state_dict":
+                self.copy_model_state(
+                    model
+                ),
+
+            "best_validation_loss":
+                best_validation_loss,
+
+            "best_epoch":
+                best_epoch,
+
+            "model_configuration": {
+                "codebook_size":
+                    self.codebook_size,
+
+                "number_of_quantizers":
+                    self.number_of_quantizers,
+
+                "embedding_dimension":
+                    self.embedding_dimension,
+
+                "number_of_heads":
+                    self.number_of_heads,
+
+                "number_of_layers":
+                    self.number_of_layers,
+
+                "feed_forward_dimension":
+                    self.feed_forward_dimension,
+
+                "dropout":
+                    self.dropout,
+
+                "n_frequency_patches":
+                    self.n_frequency_patches
+            },
+
+            "tokenizer_checkpoint":
+                str(
+                    self.tokenizer_checkpoint_path
+                ),
+
+            "saved_at":
+                datetime.now().isoformat(
+                    timespec="seconds"
+                )
+        }
+
+        if checkpoint_type == "latest":
+
+            checkpoint[
+                "optimizer_state_dict"
+            ] = (
+                optimizer.state_dict()
             )
 
-        average_loss = (
-            total_loss
-            / number_of_batches
+            file_name = (
+                f"{model_name}_latest.pt"
+            )
+
+        elif checkpoint_type == "best":
+
+            file_name = (
+                f"{model_name}_best.pt"
+            )
+
+        else:
+
+            raise ValueError(
+                "checkpoint_type must be "
+                "'latest' or 'best'."
+            )
+
+        file_path = (
+            self.checkpoint_directory
+            / file_name
         )
 
-        return average_loss
+        torch.save(
+            checkpoint,
+            file_path
+        )
+
+        return file_path
 
     def train_model(
         self,
         training_loader,
         validation_loader,
         example_context_tokens,
-        example_target_length,
+        example_target_tokens,
         epochs,
         learning_rate,
         model_name,
-        optimizer=None,
-        start_epoch=1,
-        best_validation_loss=float(
-            "inf"
-        ),
-        best_epoch=None,
-        best_model_state=None,
         patience=PATIENCE
     ):
-        """
-        Trains the autoregressive Transformer.
-
-        Latest checkpoints are saved at the
-        configured interval.
-
-        The model with the lowest validation
-        Smooth L1 loss is restored at the end.
-        """
 
         model = (
             self.create_model()
         )
 
-        if optimizer is None:
-
-            optimizer = (
-                self._create_optimizer(
-                    model=model,
-                    learning_rate=(
-                        learning_rate
-                    )
-                )
+        optimizer = (
+            self.create_optimizer(
+                model,
+                learning_rate
             )
-
-        loss_function = (
-            self._create_loss_function()
         )
 
-        history = []
+        loss_function = (
+            self.create_loss_function()
+        )
 
-        latest_checkpoint_paths = []
-
-        if best_model_state is None:
-
-            best_model_state = (
-                self.copy_model_state(
-                    model
-                )
+        # Save fixed context and ground-truth target
+        # so checkpoint generations can be compared
+        # against the same example.
+        self.save_reference_examples(
+            example_context_tokens=(
+                example_context_tokens
+            ),
+            example_target_tokens=(
+                example_target_tokens
             )
+        )
+
+        best_validation_loss = float(
+            "inf"
+        )
+
+        best_epoch = None
+
+        best_model_state = None
 
         patience_count = 0
 
-        for epoch in tqdm(
-            range(
-                start_epoch,
-                epochs + 1
-            )
+        history = []
+
+        for epoch in range(
+            1,
+            epochs + 1
         ):
 
-            training_loss = (
+            training_results = (
                 self.train_epoch(
                     model=model,
                     data_loader=(
@@ -955,7 +1252,7 @@ class TrainModelPipeline:
                 )
             )
 
-            validation_loss = (
+            validation_results = (
                 self.validate_epoch(
                     model=model,
                     data_loader=(
@@ -967,13 +1264,112 @@ class TrainModelPipeline:
                 )
             )
 
+            history.append({
+                "epoch":
+                    epoch,
+
+                "training_loss":
+                    training_results[
+                        "loss"
+                    ],
+
+                "training_accuracy":
+                    training_results[
+                        "accuracy"
+                    ],
+
+                "training_quantizer_losses":
+                    training_results[
+                        "quantizer_losses"
+                    ],
+
+                "validation_loss":
+                    validation_results[
+                        "loss"
+                    ],
+
+                "validation_accuracy":
+                    validation_results[
+                        "accuracy"
+                    ],
+
+                "validation_quantizer_losses":
+                    validation_results[
+                        "quantizer_losses"
+                    ]
+            })
+
+            print(
+                f"\nEpoch {epoch}"
+            )
+
+            print(
+                "Training loss:",
+                f"{training_results['loss']:.6f}"
+            )
+
+            print(
+                "Training token accuracy:",
+                f"{training_results['accuracy'] * 100:.3f}%"
+            )
+
+            print(
+                "Validation loss:",
+                f"{validation_results['loss']:.6f}"
+            )
+
+            print(
+                "Validation token accuracy:",
+                f"{validation_results['accuracy'] * 100:.3f}%"
+            )
+
+            print(
+                "\nTraining quantizer losses"
+            )
+
+            for (
+                quantizer_index,
+                quantizer_loss
+            ) in enumerate(
+                training_results[
+                    "quantizer_losses"
+                ]
+            ):
+
+                print(
+                    f"Q{quantizer_index + 1}: "
+                    f"{quantizer_loss:.6f}"
+                )
+
+            print(
+                "\nValidation quantizer losses"
+            )
+
+            for (
+                quantizer_index,
+                quantizer_loss
+            ) in enumerate(
+                validation_results[
+                    "quantizer_losses"
+                ]
+            ):
+
+                print(
+                    f"Q{quantizer_index + 1}: "
+                    f"{quantizer_loss:.6f}"
+                )
+
             if (
-                validation_loss
+                validation_results[
+                    "loss"
+                ]
                 < best_validation_loss
             ):
 
                 best_validation_loss = (
-                    validation_loss
+                    validation_results[
+                        "loss"
+                    ]
                 )
 
                 best_epoch = (
@@ -988,36 +1384,25 @@ class TrainModelPipeline:
 
                 patience_count = 0
 
+                self.save_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    model_name=model_name,
+                    best_validation_loss=(
+                        best_validation_loss
+                    ),
+                    best_epoch=(
+                        best_epoch
+                    ),
+                    checkpoint_type="best"
+                )
+
             else:
 
                 patience_count += 1
 
-            history.append({
-                "epoch":
-                    epoch,
-
-                "training_loss":
-                    training_loss,
-
-                "validation_loss":
-                    validation_loss,
-
-                "best_validation_loss":
-                    best_validation_loss,
-
-                "best_epoch":
-                    best_epoch
-            })
-
-            print(
-                f"\nEpoch "
-                f"{epoch} | "
-                f"Training loss: "
-                f"{training_loss:.6f} | "
-                f"Validation loss: "
-                f"{validation_loss:.6f}"
-            )
-
+            # Checkpoint + generated audio
             if (
                 epoch
                 % self.checkpoint_interval
@@ -1025,52 +1410,64 @@ class TrainModelPipeline:
             ):
 
                 checkpoint_path = (
-                    self._save_checkpoint(
+                    self.save_checkpoint(
                         model=model,
                         optimizer=optimizer,
                         epoch=epoch,
-                        model_name=(
-                            model_name
-                        ),
+                        model_name=model_name,
                         best_validation_loss=(
                             best_validation_loss
                         ),
                         best_epoch=(
                             best_epoch
                         ),
-                        best_model_state=(
-                            best_model_state
-                        ),
-                        checkpoint_type=(
-                            "latest"
-                        )
-                    )
-                )
-
-                latest_checkpoint_paths.append(
-                    checkpoint_path
-                )
-
-                example_output_path = (
-                    self.save_generated_example(
-                        model=model,
-                        context_tokens=(
-                            example_context_tokens
-                        ),
-                        number_of_target_tokens=(
-                            example_target_length
-                        ),
-                        epoch=epoch,
-                        model_name=(
-                            model_name
-                        )
+                        checkpoint_type="latest"
                     )
                 )
 
                 print(
-                    "\nGenerated example:",
-                    example_output_path
+                    "\nLatest checkpoint:",
+                    checkpoint_path
                 )
+
+                for example_index in range(
+                    len(
+                        example_context_tokens
+                    )
+                ):
+
+                    context_tokens = (
+                        example_context_tokens[
+                            example_index
+                        ]
+                    )
+
+                    target_tokens = (
+                        example_target_tokens[
+                            example_index
+                        ]
+                    )
+
+                    number_of_target_tokens = (
+                        target_tokens.shape[
+                            0
+                        ]
+                    )
+
+                    self.save_generated_example(
+                        model=model,
+                        context_token_ids=(
+                            context_tokens
+                        ),
+                        number_of_target_tokens=(
+                            number_of_target_tokens
+                        ),
+                        epoch=epoch,
+                        model_name=model_name,
+                        example_index=(
+                            example_index
+                        )
+                    )
 
             if (
                 patience_count
@@ -1078,38 +1475,17 @@ class TrainModelPipeline:
             ):
 
                 print(
-                    "Validation loss early "
+                    "\nValidation loss early "
                     "stop activated."
                 )
 
                 break
 
-        model.load_state_dict(
-            best_model_state
-        )
+        if best_model_state is not None:
 
-        best_checkpoint_path = (
-            self._save_checkpoint(
-                model=model,
-                optimizer=optimizer,
-                epoch=best_epoch,
-                model_name=(
-                    model_name
-                ),
-                best_validation_loss=(
-                    best_validation_loss
-                ),
-                best_epoch=(
-                    best_epoch
-                ),
-                best_model_state=(
-                    best_model_state
-                ),
-                checkpoint_type=(
-                    "best"
-                )
+            model.load_state_dict(
+                best_model_state
             )
-        )
 
         return {
             "model":
@@ -1125,109 +1501,48 @@ class TrainModelPipeline:
                 best_validation_loss,
 
             "best_epoch":
-                best_epoch,
-
-            "latest_checkpoint_paths":
-                latest_checkpoint_paths,
-
-            "best_checkpoint_path":
-                best_checkpoint_path
+                best_epoch
         }
-
+    
 
 if __name__ == "__main__":
 
-    # Create datasets
-    print(
-        "Creating datasets..."
-    )
-
-    (
-        training_dataset,
-        validation_dataset
-    ) = (
-        create_slakh_datasets(
-            training_path=(
-                SLAKH2100_REDUX_16K_TRAIN
+    # Load datasets
+    training_dataset = (
+        PretokenizedDrumDataset(
+            context_path=(
+                TRAINING_CONTEXT_PATH
             ),
-            validation_path=(
-                SLAKH2100_REDUX_16K_VALIDATION
-            ),
-            set_limit=(
-                SET_LIMIT
-            ),
-            maximum_tracks=(
-                MAXIMUM_TRACKS
+            target_path=(
+                TRAINING_TARGET_PATH
             )
         )
     )
 
-    # Get fixed example from validation dataset
-    (
-        example_context_tokens,
-        example_target_tokens
-    ) = (
-        validation_dataset[0]
-    )
-
-    example_target_length = (
-        example_target_tokens.shape[0]
-    )
-
-    example_context_audio = (
-        reconstruct_audio_from_stft_tokens(
-            example_context_tokens
+    validation_dataset = (
+        PretokenizedDrumDataset(
+            context_path=(
+                VALIDATION_CONTEXT_PATH
+            ),
+            target_path=(
+                VALIDATION_TARGET_PATH
+            )
         )
     )
 
-    example_target_audio = (
-        reconstruct_audio_from_stft_tokens(
-            example_target_tokens
+    test_dataset = (
+        PretokenizedDrumDataset(
+            context_path=(
+                TEST_CONTEXT_PATH
+            ),
+            target_path=(
+                TEST_TARGET_PATH
+            )
         )
     )
 
-    example_output_directory = Path(
-        EXAMPLE_OUTPUT_DIRECTORY
-    )
-
-    example_output_directory.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    sf.write(
-        example_output_directory
-        / "example_context.wav",
-        example_context_audio,
-        TARGET_SAMPLE_RATE
-    )
-
-    sf.write(
-        example_output_directory
-        / "example_target.wav",
-        example_target_audio,
-        TARGET_SAMPLE_RATE
-    )
-
     print(
-        "\nSaved fixed validation example:"
-    )
-
-    print(
-        "Context:",
-        example_output_directory
-        / "example_context.wav"
-    )
-
-    print(
-        "Target:",
-        example_output_directory
-        / "example_target.wav"
-    )
-
-    # Dataset information
-    print(
-        "\nDataset Information"
+        "\nFull Dataset Information"
     )
 
     print(
@@ -1235,16 +1550,150 @@ if __name__ == "__main__":
     )
 
     print(
-        "Training dataset size:",
+        "Training examples:",
         len(
             training_dataset
         )
     )
 
     print(
-        "Validation dataset size:",
+        "Validation examples:",
         len(
             validation_dataset
+        )
+    )
+
+    print(
+        "Test examples:",
+        len(
+            test_dataset
+        )
+    )
+
+     # Fixed validation examples
+    example_context_tokens = []
+
+    example_target_tokens = []
+
+    for example_index in range(
+        NUMBER_OF_GENERATION_EXAMPLES
+    ):
+
+        (
+            context_tokens,
+            target_tokens
+        ) = (
+            validation_dataset[
+                example_index
+            ]
+        )
+
+        example_context_tokens.append(
+            context_tokens
+        )
+
+        example_target_tokens.append(
+            target_tokens
+        )
+
+    print(
+        "\nFixed validation examples"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        "Number of examples:",
+        len(
+            example_context_tokens
+        )
+    )
+
+    for example_index in range(
+        len(
+            example_context_tokens
+        )
+    ):
+
+        print(
+            f"Example {example_index + 1} "
+            f"context shape:",
+            example_context_tokens[
+                example_index
+            ].shape
+        )
+
+        print(
+            f"Example {example_index + 1} "
+            f"target shape:",
+            example_target_tokens[
+                example_index
+            ].shape
+        )
+
+    # Small-run limits
+    if SET_LIMIT:
+
+        training_limit = min(
+            MAXIMUM_TRAINING_EXAMPLES,
+            len(
+                training_dataset
+            )
+        )
+
+        validation_limit = min(
+            MAXIMUM_VALIDATION_EXAMPLES,
+            len(
+                validation_dataset
+            )
+        )
+
+        training_dataset = (
+            Subset(
+                training_dataset,
+                range(
+                    training_limit
+                )
+            )
+        )
+
+        validation_dataset = (
+            Subset(
+                validation_dataset,
+                range(
+                    validation_limit
+                )
+            )
+        )
+
+    print(
+        "\nTraining Run Dataset Information"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        "Training examples:",
+        len(
+            training_dataset
+        )
+    )
+
+    print(
+        "Validation examples:",
+        len(
+            validation_dataset
+        )
+    )
+
+    print(
+        "Test examples reserved:",
+        len(
+            test_dataset
         )
     )
 
@@ -1267,11 +1716,17 @@ if __name__ == "__main__":
         )
     )
 
-    # Create training pipeline
+    # Pipeline
     training_pipeline = (
         TrainModelPipeline(
-            token_dimension=(
-                TOKEN_DIMENSION
+            tokenizer_checkpoint_path=(
+                TOKENIZER_CHECKPOINT_PATH
+            ),
+            codebook_size=(
+                CODEBOOK_SIZE
+            ),
+            number_of_quantizers=(
+                NUMBER_OF_QUANTIZERS
             ),
             embedding_dimension=(
                 EMBEDDING_DIMENSION
@@ -1291,9 +1746,6 @@ if __name__ == "__main__":
             n_frequency_patches=(
                 N_FREQUENCY_PATCHES
             ),
-            smooth_l1_beta=(
-                SMOOTH_L1_BETA
-            ),
             gradient_clip_norm=(
                 GRADIENT_CLIP_NORM
             ),
@@ -1305,19 +1757,16 @@ if __name__ == "__main__":
             ),
             checkpoint_directory=(
                 CHECKPOINT_DIRECTORY
+            ),
+            example_output_directory=(
+                EXAMPLE_OUTPUT_DIRECTORY
             )
         )
     )
 
-    # Device information
     print(
         "\nTraining device:",
         training_pipeline.device
-    )
-
-    print(
-        "CUDA available:",
-        torch.cuda.is_available()
     )
 
     if torch.cuda.is_available():
@@ -1329,16 +1778,21 @@ if __name__ == "__main__":
             )
         )
 
-    # Train model
-    print("\n")
+    # ========================================================
+    # Train
+    # ========================================================
+
+    print(
+        "\n"
+    )
 
     print(
         "#" * 70
     )
 
     print(
-        "AUTOREGRESSIVE DRUM "
-        "CONTINUATION TRAINING"
+        "DISCRETE AUTOREGRESSIVE "
+        "DRUM TRANSFORMER TRAINING"
     )
 
     print(
@@ -1357,8 +1811,8 @@ if __name__ == "__main__":
             example_context_tokens=(
                 example_context_tokens
             ),
-            example_target_length=(
-                example_target_length
+            example_target_tokens=(
+                example_target_tokens
             ),
             epochs=(
                 EPOCHS
@@ -1375,14 +1829,7 @@ if __name__ == "__main__":
         )
     )
 
-    # Retrieve trained model
-    trained_model = (
-        results[
-            "model"
-        ]
-    )
-
-    # Print training history
+    # Training history
     print(
         "\nTraining History"
     )
@@ -1400,12 +1847,15 @@ if __name__ == "__main__":
         print(
             f"Epoch "
             f"{epoch_results['epoch']} | "
-            f"Training loss: "
+            f"Train loss: "
             f"{epoch_results['training_loss']:.6f} | "
+            f"Train accuracy: "
+            f"{epoch_results['training_accuracy'] * 100:.3f}% | "
             f"Validation loss: "
-            f"{epoch_results['validation_loss']:.6f}"
+            f"{epoch_results['validation_loss']:.6f} | "
+            f"Validation accuracy: "
+            f"{epoch_results['validation_accuracy'] * 100:.3f}%"
         )
-
 
     print(
         "\nBest validation loss:",
@@ -1418,12 +1868,5 @@ if __name__ == "__main__":
         "Best epoch:",
         results[
             "best_epoch"
-        ]
-    )
-
-    print(
-        "Best checkpoint:",
-        results[
-            "best_checkpoint_path"
         ]
     )

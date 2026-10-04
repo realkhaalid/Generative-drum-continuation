@@ -22,11 +22,6 @@ from data_processing_pipeline import (
     FREQUENCY_PATCH_SIZE
 )
 
-
-# ============================================================
-# Configuration
-# ============================================================
-
 BATCH_SIZE = 16
 
 PATCH_DIMENSION = (
@@ -56,7 +51,7 @@ EXAMPLE_OUTPUT_DIRECTORY = (
 )
 
 MODEL_NAME = (
-    "stft_tokenizer_2"
+    "stft_tokenizer_2_retrained"
 )
 
 SET_LIMIT = False
@@ -64,20 +59,21 @@ MAXIMUM_TRACKS = 100
 
 WEIGHTED_MSE_ALPHA = 4.0
 
-QUIET_LOSS_WEIGHT = 2.0
+QUIET_LOSS_WEIGHT = 40.0
 
-TRANSIENT_LOSS_WEIGHT = 3.0
+TRANSIENT_LOSS_WEIGHT = 6.0
 
-QUIET_THRESHOLD = 0.05
+QUIET_THRESHOLD = 0.02
+
+N_FREQUENCY_PATCHES = 16
+
+# Validation reconstruction loss: 0.170231
+# Validation quiet loss: 0.009374
+# Validation transient loss: 0.095329
 
 RESUME_CHECKPOINT = (
     "tokenizer_checkpoints/stft_tokenizer_2_latest.pt"
 )
-
-
-# ============================================================
-# Training Pipeline
-# ============================================================
 
 class TrainTokenizerPipeline:
 
@@ -251,13 +247,6 @@ class TrainTokenizerPipeline:
         commitment_loss
     ):
 
-        # Restore patch structure:
-        #
-        # [B, S, patch_dimension]
-        #
-        # becomes:
-        #
-        # [B, S, 2, frequency, time]
         reconstructed_structured = (
             reconstructed_patches.reshape(
                 reconstructed_patches.shape[0],
@@ -277,10 +266,6 @@ class TrainTokenizerPipeline:
                 TIME_PATCH_SIZE
             )
         )
-
-        # ====================================================
-        # Real and imaginary components
-        # ====================================================
 
         reconstructed_real = (
             reconstructed_structured[
@@ -322,10 +307,6 @@ class TrainTokenizerPipeline:
             ]
         )
 
-        # ====================================================
-        # Magnitudes
-        # ====================================================
-
         reconstructed_magnitude = (
             torch.sqrt(
                 reconstructed_real.pow(
@@ -350,10 +331,6 @@ class TrainTokenizerPipeline:
             )
         )
 
-        # ====================================================
-        # Normalize original magnitude
-        # ====================================================
-
         maximum_magnitude = (
             original_magnitude
             .amax(
@@ -374,18 +351,12 @@ class TrainTokenizerPipeline:
             )
         )
 
-        # ====================================================
-        # 1. Weighted complex MSE
-        # ====================================================
-
         magnitude_weights = (
             1.0
             + self.weighted_mse_alpha
             * normalized_magnitude
         )
 
-        # Apply the same magnitude-derived weight
-        # to the real and imaginary channels.
         magnitude_weights = (
             magnitude_weights.unsqueeze(
                 2
@@ -404,47 +375,195 @@ class TrainTokenizerPipeline:
             * squared_error
         ).mean()
 
-        # ====================================================
-        # 2. Quiet-region loss
-        # ====================================================
-
-        quiet_mask = (
-            normalized_magnitude
-            < self.quiet_threshold
-        ).float()
-
-        # Penalize reconstructed energy in regions
-        # where the original STFT is quiet.
-        quiet_error = (
-            reconstructed_magnitude.pow(
+        original_patch_energy = (
+            original_magnitude
+            .pow(
                 2
             )
-            * quiet_mask
+            .mean(
+                dim=(
+                    2,
+                    3
+                )
+            )
         )
 
-        quiet_loss = (
-            quiet_error.sum()
+        reconstructed_patch_energy = (
+            reconstructed_magnitude
+            .pow(
+                2
+            )
+            .mean(
+                dim=(
+                    2,
+                    3
+                )
+            )
+        )
+
+        batch_size = (
+            original_patch_energy.shape[
+                0
+            ]
+        )
+
+        sequence_length = (
+            original_patch_energy.shape[
+                1
+            ]
+        )
+
+        number_of_frequency_patches = (
+            N_FREQUENCY_PATCHES
+        )
+
+        if (
+            sequence_length
+            % number_of_frequency_patches
+            != 0
+        ):
+
+            raise ValueError(
+                "Sequence length must be divisible "
+                "by the number of frequency patches."
+            )
+
+        number_of_time_patches = (
+            sequence_length
+            // number_of_frequency_patches
+        )
+
+        original_patch_energy = (
+            original_patch_energy.reshape(
+                batch_size,
+                number_of_time_patches,
+                number_of_frequency_patches
+            )
+        )
+
+        reconstructed_patch_energy = (
+            reconstructed_patch_energy.reshape(
+                batch_size,
+                number_of_time_patches,
+                number_of_frequency_patches
+            )
+        )
+
+        original_time_energy = (
+            original_patch_energy.mean(
+                dim=2
+            )
+        )
+
+        reconstructed_time_energy = (
+            reconstructed_patch_energy.mean(
+                dim=2
+            )
+        )
+
+        maximum_time_energy = (
+            original_time_energy
+            .amax(
+                dim=1,
+                keepdim=True
+            )
+        )
+
+        normalized_time_energy = (
+            original_time_energy
             / (
-                quiet_mask.sum()
+                maximum_time_energy
                 + 1e-8
             )
         )
 
-        # ====================================================
-        # 3. Transient / onset loss
-        # ====================================================
+        quiet_time_mask = (
+            normalized_time_energy
+            < self.quiet_threshold
+        ).float()
 
-        # Measure frame-to-frame magnitude changes
-        # within each time-frequency patch.
+        quiet_loss = (
+            (
+                reconstructed_time_energy
+                * quiet_time_mask
+            ).sum()
+            / (
+                quiet_time_mask.sum()
+                + 1e-8
+            )
+        )
+
+        original_magnitude_grid = (
+            original_magnitude.reshape(
+                batch_size,
+                number_of_time_patches,
+                number_of_frequency_patches,
+                FREQUENCY_PATCH_SIZE,
+                TIME_PATCH_SIZE
+            )
+        )
+
+        reconstructed_magnitude_grid = (
+            reconstructed_magnitude.reshape(
+                batch_size,
+                number_of_time_patches,
+                number_of_frequency_patches,
+                FREQUENCY_PATCH_SIZE,
+                TIME_PATCH_SIZE
+            )
+        )
+
+        original_magnitude_grid = (
+            original_magnitude_grid
+            .permute(
+                0,
+                2,
+                3,
+                1,
+                4
+            )
+            .reshape(
+                batch_size,
+                (
+                    number_of_frequency_patches
+                    * FREQUENCY_PATCH_SIZE
+                ),
+                (
+                    number_of_time_patches
+                    * TIME_PATCH_SIZE
+                )
+            )
+        )
+
+        reconstructed_magnitude_grid = (
+            reconstructed_magnitude_grid
+            .permute(
+                0,
+                2,
+                3,
+                1,
+                4
+            )
+            .reshape(
+                batch_size,
+                (
+                    number_of_frequency_patches
+                    * FREQUENCY_PATCH_SIZE
+                ),
+                (
+                    number_of_time_patches
+                    * TIME_PATCH_SIZE
+                )
+            )
+        )
+
         original_difference = (
-            original_magnitude[
-                :,
+            original_magnitude_grid[
                 :,
                 :,
                 1:
             ]
-            - original_magnitude[
-                :,
+            - original_magnitude_grid[
                 :,
                 :,
                 :-1
@@ -452,14 +571,12 @@ class TrainTokenizerPipeline:
         )
 
         reconstructed_difference = (
-            reconstructed_magnitude[
-                :,
+            reconstructed_magnitude_grid[
                 :,
                 :,
                 1:
             ]
-            - reconstructed_magnitude[
-                :,
+            - reconstructed_magnitude_grid[
                 :,
                 :,
                 :-1
@@ -473,17 +590,9 @@ class TrainTokenizerPipeline:
             )
         )
 
-        # ====================================================
-        # 4. Commitment loss
-        # ====================================================
-
         commitment_loss = (
             commitment_loss.mean()
         )
-
-        # ====================================================
-        # Total loss
-        # ====================================================
 
         total_loss = (
             weighted_reconstruction_loss
@@ -782,6 +891,8 @@ class TrainTokenizerPipeline:
         epoch,
         model_name,
         best_validation_loss,
+        best_validation_quiet_loss,
+        best_quiet_epoch,
         best_epoch,
         checkpoint_type="latest"
     ):
@@ -801,6 +912,12 @@ class TrainTokenizerPipeline:
 
             "best_validation_loss":
                 best_validation_loss,
+
+            "best_validation_quiet_loss":
+                best_validation_quiet_loss,
+
+            "best_quiet_epoch":
+                best_quiet_epoch,
 
             "best_epoch":
                 best_epoch,
@@ -844,10 +961,16 @@ class TrainTokenizerPipeline:
                 f"{model_name}_latest.pt"
             )
 
-        else:
+        elif checkpoint_type == "best":
 
             file_name = (
                 f"{model_name}_best.pt"
+            )
+
+        elif checkpoint_type == "best_quiet":
+
+            file_name = (
+                f"{model_name}_best_quiet.pt"
             )
 
         file_path = (
@@ -1094,6 +1217,12 @@ class TrainTokenizerPipeline:
             "inf"
         )
 
+        best_validation_quiet_loss = float(
+            "inf"
+        )
+
+        best_quiet_epoch = None
+
         best_epoch = None
         best_model_state = None
 
@@ -1269,6 +1398,12 @@ class TrainTokenizerPipeline:
                     best_validation_loss=(
                         best_validation_loss
                     ),
+                    best_validation_quiet_loss=(
+                        best_validation_quiet_loss
+                    ),
+                    best_quiet_epoch=(
+                        best_quiet_epoch
+                    ),
                     best_epoch=(
                         best_epoch
                     ),
@@ -1278,6 +1413,43 @@ class TrainTokenizerPipeline:
             else:
 
                 patience_count += 1
+
+            if (
+                validation_results[
+                    "quiet_loss"
+                ]
+                < best_validation_quiet_loss
+            ):
+
+                best_validation_quiet_loss = (
+                    validation_results[
+                        "quiet_loss"
+                    ]
+                )
+
+                best_quiet_epoch = (
+                    epoch
+                )
+
+                self.save_checkpoint(
+                    tokenizer=tokenizer,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    model_name=model_name,
+                    best_validation_loss=(
+                        best_validation_loss
+                    ),
+                    best_validation_quiet_loss=(
+                        best_validation_quiet_loss
+                    ),
+                    best_quiet_epoch=(
+                        best_quiet_epoch
+                    ),
+                    best_epoch=(
+                        best_epoch
+                    ),
+                    checkpoint_type="best_quiet"
+                )
 
             if (
                 epoch
@@ -1292,6 +1464,12 @@ class TrainTokenizerPipeline:
                     model_name=model_name,
                     best_validation_loss=(
                         best_validation_loss
+                    ),
+                    best_validation_quiet_loss=(
+                        best_validation_quiet_loss
+                    ),
+                    best_quiet_epoch=(
+                        best_quiet_epoch
                     ),
                     best_epoch=(
                         best_epoch
@@ -1941,11 +2119,6 @@ class TrainTokenizerPipeline:
 
         return results
 
-
-# ============================================================
-# Main
-# ============================================================
-
 if __name__ == "__main__":
 
     print(
@@ -2127,36 +2300,9 @@ if __name__ == "__main__":
         "#" * 70
     )
 
-    # results = (
-    #     training_pipeline
-    #     .train_tokenizer(
-    #         training_loader=(
-    #             training_loader
-    #         ),
-    #         validation_loader=(
-    #             validation_loader
-    #         ),
-    #         example_patches=(
-    #             example_context_patches
-    #         ),
-    #         epochs=(
-    #             EPOCHS
-    #         ),
-    #         learning_rate=(
-    #             LEARNING_RATE
-    #         ),
-    #         model_name=(
-    #             MODEL_NAME
-    #         ),
-    #         patience=(
-    #             PATIENCE
-    #         )
-    #     )
-    # )
-
     results = (
         training_pipeline
-        .resume_tokenizer_training(
+        .train_tokenizer(
             training_loader=(
                 training_loader
             ),
@@ -2166,9 +2312,8 @@ if __name__ == "__main__":
             example_patches=(
                 example_context_patches
             ),
-            checkpoint_path=RESUME_CHECKPOINT,
             epochs=(
-                30
+                EPOCHS
             ),
             learning_rate=(
                 LEARNING_RATE
@@ -2181,6 +2326,34 @@ if __name__ == "__main__":
             )
         )
     )
+
+    # results = (
+    #     training_pipeline
+    #     .resume_tokenizer_training(
+    #         training_loader=(
+    #             training_loader
+    #         ),
+    #         validation_loader=(
+    #             validation_loader
+    #         ),
+    #         example_patches=(
+    #             example_context_patches
+    #         ),
+    #         checkpoint_path=RESUME_CHECKPOINT,
+    #         epochs=(
+    #             30
+    #         ),
+    #         learning_rate=(
+    #             LEARNING_RATE
+    #         ),
+    #         model_name=(
+    #             MODEL_NAME
+    #         ),
+    #         patience=(
+    #             PATIENCE
+    #         )
+    #     )
+    # )
 
     print(
         "\nTraining History"

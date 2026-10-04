@@ -5,37 +5,58 @@ from positional_encoding_functions import (
     add_sequence_positional_encoding
 )
 
+#Config
+EMBEDDING_DIM = 256
+NUM_HEADS = 8
+NUM_LAYERS = 4
+FF_DIM = 1024
+DROPOUT = 0.1
+N_FREQUENCY_PATCHES = 16
+
+
 class AutoregressiveDrumTransformer(
     nn.Module
 ):
     """
     Autoregressive causal Transformer for
-    drum audio continuation.
+    discrete drum-token continuation.
 
     Input:
-        [batch_size, sequence_length, token_dimension]
+        [batch_size, sequence_length, number_of_quantizers]
 
     Output:
-        [batch_size, sequence_length, token_dimension]
+        [batch_size,
+         sequence_length,
+         number_of_quantizers,
+         codebook_size]
 
-    Each output position predicts the next
-    STFT token in the sequence.
+    Each sequence position represents one
+    STFT time-frequency patch.
+
+    Each patch contains one token ID from
+    every Residual VQ quantizer.
     """
 
     def __init__(
         self,
-        token_dimension=512,
-        embedding_dimension=256,
-        number_of_heads=8,
-        number_of_layers=4,
-        feed_forward_dimension=1024,
-        dropout=0.1,
-        n_frequency_patches=16
+        codebook_size=1024,
+        number_of_quantizers=8,
+        embedding_dimension=EMBEDDING_DIM,
+        number_of_heads=NUM_HEADS,
+        number_of_layers=NUM_LAYERS,
+        feed_forward_dimension=FF_DIM,
+        dropout=DROPOUT,
+        n_frequency_patches=N_FREQUENCY_PATCHES
     ):
+
         super().__init__()
 
-        self.token_dimension = (
-            token_dimension
+        self.codebook_size = (
+            codebook_size
+        )
+
+        self.number_of_quantizers = (
+            number_of_quantizers
         )
 
         self.embedding_dimension = (
@@ -46,9 +67,23 @@ class AutoregressiveDrumTransformer(
             n_frequency_patches
         )
 
-        self.token_embedding = nn.Linear(
-            token_dimension,
-            embedding_dimension
+        # Each Residual VQ level has its
+        # own independent codebook.
+        #
+        # Therefore each quantizer needs
+        # its own token embedding table.
+        self.token_embeddings = (
+            nn.ModuleList(
+                [
+                    nn.Embedding(
+                        codebook_size,
+                        embedding_dimension
+                    )
+                    for _ in range(
+                        number_of_quantizers
+                    )
+                ]
+            )
         )
 
         transformer_layer = (
@@ -83,9 +118,23 @@ class AutoregressiveDrumTransformer(
             )
         )
 
-        self.output_projection = nn.Linear(
-            embedding_dimension,
-            token_dimension
+        # Each Residual VQ level also has
+        # its own output classification head.
+        #
+        # Every head predicts one of
+        # codebook_size possible IDs.
+        self.output_heads = (
+            nn.ModuleList(
+                [
+                    nn.Linear(
+                        embedding_dimension,
+                        codebook_size
+                    )
+                    for _ in range(
+                        number_of_quantizers
+                    )
+                ]
+            )
         )
 
         self._initialize_weights()
@@ -94,18 +143,37 @@ class AutoregressiveDrumTransformer(
         self
     ):
         """
-        Initializes trainable matrices using
-        Xavier uniform initialization.
+        Initializes trainable weight matrices.
         """
 
-        for parameter in (
-            self.parameters()
+        for module in (
+            self.modules()
         ):
 
-            if parameter.dim() > 1:
+            if isinstance(
+                module,
+                nn.Linear
+            ):
 
                 nn.init.xavier_uniform_(
-                    parameter
+                    module.weight
+                )
+
+                if module.bias is not None:
+
+                    nn.init.zeros_(
+                        module.bias
+                    )
+
+            elif isinstance(
+                module,
+                nn.Embedding
+            ):
+
+                nn.init.normal_(
+                    module.weight,
+                    mean=0.0,
+                    std=0.02
                 )
 
     def create_causal_mask(
@@ -132,47 +200,153 @@ class AutoregressiveDrumTransformer(
 
         return causal_mask
 
+    def embed_tokens(
+        self,
+        token_ids
+    ):
+        """
+        Embeds all Residual VQ token IDs.
+        Embeddings from all Residual VQ
+        levels are summed to create one
+        representation for each STFT patch.
+        """
+
+        embedded_tokens = None
+
+        for quantizer_index in range(
+            self.number_of_quantizers
+        ):
+
+            quantizer_token_ids = (
+                token_ids[
+                    :,
+                    :,
+                    quantizer_index
+                ]
+            )
+
+            quantizer_embeddings = (
+                self.token_embeddings[
+                    quantizer_index
+                ](
+                    quantizer_token_ids
+                )
+            )
+
+            if embedded_tokens is None:
+
+                embedded_tokens = (
+                    quantizer_embeddings
+                )
+
+            else:
+
+                embedded_tokens = (
+                    embedded_tokens
+                    + quantizer_embeddings
+                )
+
+        return embedded_tokens
+
+    def project_to_logits(
+        self,
+        transformer_output
+    ):
+        """
+        Converts Transformer hidden states
+        into categorical logits for every
+        Residual VQ quantizer.
+        """
+
+        quantizer_logits = []
+
+        for quantizer_index in range(
+            self.number_of_quantizers
+        ):
+
+            logits = (
+                self.output_heads[
+                    quantizer_index
+                ](
+                    transformer_output
+                )
+            )
+
+            quantizer_logits.append(
+                logits
+            )
+
+        logits = torch.stack(
+            quantizer_logits,
+            dim=2
+        )
+
+        return logits
+
     def forward(
         self,
-        tokens
+        token_ids
     ):
         """
         Performs causal next-token prediction.
         """
 
-        if tokens.ndim != 3:
+        if token_ids.ndim != 3:
 
             raise ValueError(
-                "Expected token tensor shape "
+                "Expected token ID tensor shape "
                 "[batch_size, sequence_length, "
-                "token_dimension], but received "
-                f"{tokens.shape}."
+                "number_of_quantizers], but received "
+                f"{token_ids.shape}."
             )
 
         if (
-            tokens.shape[2]
-            != self.token_dimension
+            token_ids.shape[
+                2
+            ]
+            != self.number_of_quantizers
         ):
 
             raise ValueError(
-                f"Expected token dimension "
-                f"{self.token_dimension}, "
-                f"but received "
-                f"{tokens.shape[2]}."
+                f"Expected "
+                f"{self.number_of_quantizers} "
+                f"quantizers, but received "
+                f"{token_ids.shape[2]}."
+            )
+
+        if (
+            token_ids.dtype
+            != torch.long
+        ):
+
+            token_ids = (
+                token_ids.long()
+            )
+
+        if (
+            token_ids.min()
+            < 0
+            or token_ids.max()
+            >= self.codebook_size
+        ):
+
+            raise ValueError(
+                "Token IDs must be between "
+                f"0 and {self.codebook_size - 1}."
             )
 
         sequence_length = (
-            tokens.shape[1]
+            token_ids.shape[
+                1
+            ]
         )
 
-        # 1. Token embedding
         embeddings = (
-            self.token_embedding(
-                tokens
+            self.embed_tokens(
+                token_ids
             )
         )
 
-        # 2. 2D positional encoding
         embeddings = (
             add_sequence_positional_encoding(
                 embeddings,
@@ -180,7 +354,6 @@ class AutoregressiveDrumTransformer(
             )
         )
 
-        # 3. Causal attention mask
         causal_mask = (
             self.create_causal_mask(
                 sequence_length,
@@ -188,7 +361,6 @@ class AutoregressiveDrumTransformer(
             )
         )
 
-        # 4. Transformer
         transformer_output = (
             self.transformer(
                 embeddings,
@@ -197,53 +369,62 @@ class AutoregressiveDrumTransformer(
             )
         )
 
-        # 5. Predict STFT token
-        predictions = (
-            self.output_projection(
+        logits = (
+            self.project_to_logits(
                 transformer_output
             )
         )
 
-        return predictions
+        return logits
 
     def generate_continuation(
         self,
-        context_tokens,
+        context_token_ids,
         number_of_target_tokens
     ):
         """
-        Autoregressively generates target tokens
-        from a context sequence.
+        Autoregressively generates future
+        Residual VQ token IDs.
         """
 
         self.eval()
 
-        if context_tokens.ndim == 2:
+        if (
+            context_token_ids.ndim
+            == 2
+        ):
 
-            context_tokens = (
-                context_tokens.unsqueeze(
+            context_token_ids = (
+                context_token_ids.unsqueeze(
                     0
                 )
             )
 
-        if context_tokens.ndim != 3:
-
-            raise ValueError(
-                "Context tokens must have shape "
-                "[sequence, token] or "
-                "[batch, sequence, token]."
-            )
-
         if (
-            context_tokens.shape[2]
-            != self.token_dimension
+            context_token_ids.ndim
+            != 3
         ):
 
             raise ValueError(
-                f"Expected token dimension "
-                f"{self.token_dimension}, "
-                f"but received "
-                f"{context_tokens.shape[2]}."
+                "Context token IDs must have shape "
+                "[sequence_length, number_of_quantizers] "
+                "or "
+                "[batch_size, sequence_length, "
+                "number_of_quantizers]."
+            )
+
+        if (
+            context_token_ids.shape[
+                2
+            ]
+            != self.number_of_quantizers
+        ):
+
+            raise ValueError(
+                f"Expected "
+                f"{self.number_of_quantizers} "
+                f"quantizers, but received "
+                f"{context_token_ids.shape[2]}."
             )
 
         device = next(
@@ -251,9 +432,9 @@ class AutoregressiveDrumTransformer(
         ).device
 
         generated_sequence = (
-            context_tokens.to(
+            context_token_ids.to(
                 device=device,
-                dtype=torch.float32
+                dtype=torch.long
             )
         )
 
@@ -263,25 +444,44 @@ class AutoregressiveDrumTransformer(
                 number_of_target_tokens
             ):
 
-                predictions = (
+                logits = (
                     self(
                         generated_sequence
                     )
                 )
 
-                next_token = (
-                    predictions[
+                # Last patch position:
+                #
+                # [B, Q, codebook_size]
+                next_token_logits = (
+                    logits[
                         :,
-                        -1:,
+                        -1,
+                        :,
                         :
                     ]
+                )
+
+                # Greedy token selection
+                next_token_ids = (
+                    torch.argmax(
+                        next_token_logits,
+                        dim=-1
+                    )
+                )
+
+                # Add sequence dimension:
+                next_token_ids = (
+                    next_token_ids.unsqueeze(
+                        1
+                    )
                 )
 
                 generated_sequence = (
                     torch.cat(
                         [
                             generated_sequence,
-                            next_token
+                            next_token_ids
                         ],
                         dim=1
                     )
@@ -299,12 +499,15 @@ class AutoregressiveDrumTransformer(
 
 if __name__ == "__main__":
 
-    # Testing
+
+    # Testing REMEMBER TO UNCOMMENT CODE ABOVE
     from construct_dataset import (
         create_slakh_datasets,
         SLAKH2100_REDUX_16K_TRAIN,
         SLAKH2100_REDUX_16K_VALIDATION
     )
+
+    from stft_tokeniser import STFTTokenizer
 
     SET_LIMIT = True
     MAX_TRACKS = 1
@@ -324,84 +527,234 @@ if __name__ == "__main__":
         maximum_tracks=MAX_TRACKS
     )
 
-    print("\nTraining dataset size:")
-    print(
-        len(training_dataset)
+    TOKENIZER_CHECKPOINT_PATH = (
+        "tokenizer_checkpoints/"
+        "stft_tokenizer_2_best.pt"
     )
 
-    # 2. Retrieve one example
     (
-        context_tokens,
-        target_tokens
-    ) = training_dataset[0]
-
-    print("\nIndividual sample")
-    print("=" * 60)
-
-    print(
-        "Context shape:",
-        context_tokens.shape
+        context_patches,
+        target_patches
+    ) = (
+        training_dataset[
+            0
+        ]
     )
 
     print(
-        "Target shape:",
-        target_tokens.shape
+        "\nSTFT patch tensors"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        "Context patches shape:",
+        context_patches.shape
+    )
+
+    print(
+        "Target patches shape:",
+        target_patches.shape
     )
 
     # Add batch dimension.
-    context_tokens = (
-        context_tokens.unsqueeze(0)
+    context_patches = (
+        context_patches.unsqueeze(
+            0
+        )
     )
 
-    target_tokens = (
-        target_tokens.unsqueeze(0)
-    )
-
-    print("\nAfter adding batch dimension")
-    print("=" * 60)
-
-    print(
-        "Context shape:",
-        context_tokens.shape
+    target_patches = (
+        target_patches.unsqueeze(
+            0
+        )
     )
 
     print(
-        "Target shape:",
-        target_tokens.shape
+        "\nAfter adding batch dimension"
     )
 
-    # 3. Combine context and target
+    print(
+        "=" * 60
+    )
+
+    print(
+        "Context patches shape:",
+        context_patches.shape
+    )
+
+    print(
+        "Target patches shape:",
+        target_patches.shape
+    )
+
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    tokenizer = (
+        STFTTokenizer()
+        .to(
+            device
+        )
+    )
+
+    tokenizer_checkpoint = torch.load(
+        TOKENIZER_CHECKPOINT_PATH,
+        map_location=device,
+        weights_only=False
+    )
+
+    tokenizer.load_state_dict(
+        tokenizer_checkpoint[
+            "model_state_dict"
+        ]
+    )
+
+    tokenizer.eval()
+
+    print(
+        "\nTokenizer loaded"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        "Tokenizer checkpoint:",
+        TOKENIZER_CHECKPOINT_PATH
+    )
+
+    print(
+        "Device:",
+        device
+    )
+
+    context_patches = (
+        context_patches.to(
+            device=device,
+            dtype=torch.float32
+        )
+    )
+
+    target_patches = (
+        target_patches.to(
+            device=device,
+            dtype=torch.float32
+        )
+    )
+
+    with torch.no_grad():
+
+        (
+            context_reconstruction,
+            context_token_ids,
+            context_commitment_loss
+        ) = (
+            tokenizer(
+                context_patches
+            )
+        )
+
+        (
+            target_reconstruction,
+            target_token_ids,
+            target_commitment_loss
+        ) = (
+            tokenizer(
+                target_patches
+            )
+        )
+
+    print(
+        "\nTokenizer output"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        "Context token IDs shape:",
+        context_token_ids.shape
+    )
+
+    print(
+        "Target token IDs shape:",
+        target_token_ids.shape
+    )
+
+    print(
+        "Context token dtype:",
+        context_token_ids.dtype
+    )
+
+    print(
+        "Target token dtype:",
+        target_token_ids.dtype
+    )
+
+    print(
+        "Context token min/max:",
+        context_token_ids.min().item(),
+        context_token_ids.max().item()
+    )
+
+    print(
+        "Target token min/max:",
+        target_token_ids.min().item(),
+        target_token_ids.max().item()
+    )
+
     full_sequence = torch.cat(
         [
-            context_tokens,
-            target_tokens
+            context_token_ids,
+            target_token_ids
         ],
         dim=1
     )
 
-    print("\nFull sequence")
-    print("=" * 60)
+    print(
+        "\nFull discrete token sequence"
+    )
+
+    print(
+        "=" * 60
+    )
 
     print(
         "Full sequence shape:",
         full_sequence.shape
     )
 
-    # 4. Shift for autoregressive training
-    model_input = full_sequence[
-        :,
-        :-1,
-        :
-    ]
+    model_input = (
+        full_sequence[
+            :,
+            :-1,
+            :
+        ]
+    )
 
-    expected_output = full_sequence[
-        :,
-        1:,
-        :
-    ]
+    expected_output = (
+        full_sequence[
+            :,
+            1:,
+            :
+        ]
+    )
 
-    print("\nAutoregressive shift")
-    print("=" * 60)
+    print(
+        "\nAutoregressive shift"
+    )
+
+    print(
+        "=" * 60
+    )
 
     print(
         "Model input shape:",
@@ -413,44 +766,47 @@ if __name__ == "__main__":
         expected_output.shape
     )
 
-    # 5. Create Transformer
     model = (
-        AutoregressiveDrumTransformer(
-            token_dimension=512,
-            embedding_dimension=256,
-            number_of_heads=8,
-            number_of_layers=4,
-            feed_forward_dimension=1024,
-            dropout=0.1,
-            n_frequency_patches=16
+        AutoregressiveDrumTransformer()
+        .to(
+            device
         )
     )
 
-    print("\nModel created")
-    print("=" * 60)
+    print(
+        "\nTransformer created"
+    )
 
-    # 6. One forward pass
+    print(
+        "=" * 60
+    )
+
     model.eval()
 
     with torch.no_grad():
 
-        predictions = (
+        logits = (
             model(
                 model_input
             )
         )
 
-    print("\nForward pass")
-    print("=" * 60)
+    print(
+        "\nTransformer forward pass"
+    )
 
     print(
-        "Input shape:",
+        "=" * 60
+    )
+
+    print(
+        "Model input shape:",
         model_input.shape
     )
 
     print(
-        "Prediction shape:",
-        predictions.shape
+        "Logits shape:",
+        logits.shape
     )
 
     print(
@@ -459,19 +815,31 @@ if __name__ == "__main__":
     )
 
     print(
-        "Prediction dtype:",
-        predictions.dtype
+        "Expected logits shape:",
+        (
+            model_input.shape[0],
+            model_input.shape[1],
+            8,
+            1024
+        )
     )
 
-    # 7. Check continuation section
+    print(
+        "Logits dtype:",
+        logits.dtype
+    )
+
     context_length = (
-        context_tokens.shape[1]
+        context_token_ids.shape[
+            1
+        ]
     )
 
-    target_predictions = (
-        predictions[
+    target_logits = (
+        logits[
             :,
             context_length - 1:,
+            :,
             :
         ]
     )
@@ -484,12 +852,17 @@ if __name__ == "__main__":
         ]
     )
 
-    print("\nTarget continuation section")
-    print("=" * 60)
+    print(
+        "\nTarget continuation section"
+    )
 
     print(
-        "Target predictions shape:",
-        target_predictions.shape
+        "=" * 60
+    )
+
+    print(
+        "Target logits shape:",
+        target_logits.shape
     )
 
     print(
@@ -497,73 +870,321 @@ if __name__ == "__main__":
         target_expected.shape
     )
 
-    print("\nNumerical ranges")
-    print("=" * 60)
-
-    print(
-        "Input min/max:",
-        model_input.min().item(),
-        model_input.max().item()
-    )
-
-    print(
-        "Target min/max:",
-        target_expected.min().item(),
-        target_expected.max().item()
-    )
-
-    print(
-        "Prediction min/max:",
-        predictions.min().item(),
-        predictions.max().item()
-    )
-
-    print(
-        "Input mean/std:",
-        model_input.mean().item(),
-        model_input.std().item()
-    )
-
-    print(
-        "Target mean/std:",
-        target_expected.mean().item(),
-        target_expected.std().item()
-    )
-
-    # 8. Calculate example loss
-    mse_loss_function = (
-        nn.MSELoss()
-    )
-
-    smooth_l1_loss_function = (
-        nn.SmoothL1Loss(
-            beta=3.0
+    predicted_token_ids = (
+        torch.argmax(
+            target_logits,
+            dim=-1
         )
     )
 
-    mse_loss = (
-        mse_loss_function(
-            target_predictions,
-            target_expected
-        )
-    )
-
-    smooth_l1_loss = (
-        smooth_l1_loss_function(
-            target_predictions,
-            target_expected
-        )
-    )
-
-    print("\nLoss comparison")
-    print("=" * 60)
-
     print(
-        "MSE loss:",
-        mse_loss.item()
+        "\nPredicted token IDs"
     )
 
     print(
-        "Smooth L1 loss:",
-        smooth_l1_loss.item()
+        "=" * 60
+    )
+
+    print(
+        "Predicted IDs shape:",
+        predicted_token_ids.shape
+    )
+
+    print(
+        "Predicted IDs dtype:",
+        predicted_token_ids.dtype
+    )
+
+    print(
+        "Predicted IDs min/max:",
+        predicted_token_ids.min().item(),
+        predicted_token_ids.max().item()
+    )
+
+    print(
+        "First predicted patch:"
+    )
+
+    print(
+        predicted_token_ids[
+            0,
+            0
+        ]
+    )
+
+    print(
+        "First expected patch:"
+    )
+
+    print(
+        target_expected[
+            0,
+            0
+        ]
+    )
+
+    cross_entropy_loss = (
+        nn.CrossEntropyLoss()
+    )
+
+    quantizer_losses = []
+
+    for quantizer_index in range(
+        8
+    ):
+
+        quantizer_logits = (
+            target_logits[
+                :,
+                :,
+                quantizer_index,
+                :
+            ]
+        )
+
+        quantizer_targets = (
+            target_expected[
+                :,
+                :,
+                quantizer_index
+            ]
+        )
+
+        quantizer_loss = (
+            cross_entropy_loss(
+                quantizer_logits.reshape(
+                    -1,
+                    1024
+                ),
+                quantizer_targets.reshape(
+                    -1
+                )
+            )
+        )
+
+        quantizer_losses.append(
+            quantizer_loss
+        )
+
+        print(
+            f"Quantizer {quantizer_index + 1} "
+            f"CrossEntropy loss:",
+            quantizer_loss.item()
+        )
+
+    total_loss = (
+        torch.stack(
+            quantizer_losses
+        )
+        .mean()
+    )
+
+    print(
+        "\nLoss test"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        "Mean CrossEntropy loss:",
+        total_loss.item()
+    )
+
+    print(
+        "Loss finite:",
+        torch.isfinite(
+            total_loss
+        ).item()
+    )
+
+    model.train()
+
+    model.zero_grad()
+
+    logits = (
+        model(
+            model_input
+        )
+    )
+
+    target_logits = (
+        logits[
+            :,
+            context_length - 1:,
+            :,
+            :
+        ]
+    )
+
+    quantizer_losses = []
+
+    for quantizer_index in range(
+        8
+    ):
+
+        quantizer_loss = (
+            cross_entropy_loss(
+                target_logits[
+                    :,
+                    :,
+                    quantizer_index,
+                    :
+                ]
+                .reshape(
+                    -1,
+                    1024
+                ),
+                target_expected[
+                    :,
+                    :,
+                    quantizer_index
+                ]
+                .reshape(
+                    -1
+                )
+            )
+        )
+
+        quantizer_losses.append(
+            quantizer_loss
+        )
+
+    total_loss = (
+        torch.stack(
+            quantizer_losses
+        )
+        .mean()
+    )
+
+    total_loss.backward()
+
+    print(
+        "\nBackpropagation test"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        "Embedding 1 gradient exists:",
+        model.token_embeddings[
+            0
+        ].weight.grad
+        is not None
+    )
+
+    print(
+        "Embedding 8 gradient exists:",
+        model.token_embeddings[
+            7
+        ].weight.grad
+        is not None
+    )
+
+    print(
+        "Output head 1 gradient exists:",
+        model.output_heads[
+            0
+        ].weight.grad
+        is not None
+    )
+
+    print(
+        "Output head 8 gradient exists:",
+        model.output_heads[
+            7
+        ].weight.grad
+        is not None
+    )
+
+    print(
+        "Embedding 1 gradient mean:",
+        model.token_embeddings[
+            0
+        ]
+        .weight
+        .grad
+        .abs()
+        .mean()
+        .item()
+    )
+
+    print(
+        "Output head 1 gradient mean:",
+        model.output_heads[
+            0
+        ]
+        .weight
+        .grad
+        .abs()
+        .mean()
+        .item()
+    )
+
+    print(
+        "\nFinal checks"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        "Input is torch.long:",
+        model_input.dtype
+        == torch.long
+    )
+
+    print(
+        "Correct number of quantizers:",
+        model_input.shape[
+            2
+        ]
+        == 8
+    )
+
+    print(
+        "Prediction sequence length correct:",
+        logits.shape[
+            1
+        ]
+        == model_input.shape[
+            1
+        ]
+    )
+
+    print(
+        "Prediction quantizer count correct:",
+        logits.shape[
+            2
+        ]
+        == 8
+    )
+
+    print(
+        "Prediction vocabulary size correct:",
+        logits.shape[
+            3
+        ]
+        == 1024
+    )
+
+    print(
+        "All logits finite:",
+        torch.isfinite(
+            logits
+        )
+        .all()
+        .item()
+    )
+
+    print(
+        "Total loss finite:",
+        torch.isfinite(
+            total_loss
+        )
+        .item()
     )

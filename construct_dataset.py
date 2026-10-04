@@ -35,6 +35,11 @@ SLAKH2100_REDUX_16K_VALIDATION = Path(
     "slakh2100_redux_16k/validation"
 )
 
+SLAKH2100_REDUX_16K_TEST = Path(
+    "C:/Uni/YearProject/datasets"
+    "/slakh2100_redux_16k/test"
+)
+
 # Dataset
 class DrumContinuationDataset(
     Dataset
@@ -479,6 +484,24 @@ def create_slakh_datasets(
         validation_dataset
     )
 
+def create_test_slakh_dataset(
+        test_path,
+        set_limit=SET_TRACK_LIMIT,
+        maximum_tracks=MAXIMUM_TRACKS
+):
+    test_files = find_drum_audio_files_slakh_redux(
+        test_path,
+        set_limit=set_limit,
+        maximum_tracks=maximum_tracks
+    )
+
+    test_dataset = DrumContinuationDataset(
+        test_files,
+        dataset_source="slakh"
+    )
+
+    return test_dataset
+
 # Numerical dataset statistics
 def calculate_dataset_statistics(
     dataset
@@ -744,6 +767,8 @@ def check_dataset(
     print(
         "=" * 60
     )
+
+    print(f"Dataset examples {len(dataset)}")
 
     stats = (
         dataset
