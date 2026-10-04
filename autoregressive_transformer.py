@@ -1,6 +1,12 @@
 import torch
 import torch.nn as nn
 
+from transformers import (
+    TemperatureLogitsWarper,
+    TopKLogitsWarper,
+    TopPLogitsWarper
+)
+
 from positional_encoding_functions import (
     add_sequence_positional_encoding
 )
@@ -486,6 +492,245 @@ class AutoregressiveDrumTransformer(
                         dim=1
                     )
                 )
+
+        generated_target = (
+            generated_sequence[
+                :,
+                -number_of_target_tokens:,
+                :
+            ]
+        )
+
+        return generated_target
+
+    def sample_inference_tokens(
+        self,
+        next_token_logits,
+        temperature=0.8,
+        top_k=20,
+        top_p=0.9
+    ):
+
+        batch_size = (
+            next_token_logits.shape[
+                0
+            ]
+        )
+
+        number_of_quantizers = (
+            next_token_logits.shape[
+                1
+            ]
+        )
+
+        logits = (
+            next_token_logits.reshape(
+                batch_size
+                * number_of_quantizers,
+                self.codebook_size
+            )
+        )
+
+        dummy_input_ids = torch.zeros(
+            (
+                batch_size
+                * number_of_quantizers,
+                1
+            ),
+            device=logits.device,
+            dtype=torch.long
+        )
+
+        temperature_warper = (
+            TemperatureLogitsWarper(
+                temperature
+            )
+        )
+
+        top_k_warper = (
+            TopKLogitsWarper(
+                top_k
+            )
+        )
+
+        top_p_warper = (
+            TopPLogitsWarper(
+                top_p
+            )
+        )
+
+        logits = (
+            temperature_warper(
+                dummy_input_ids,
+                logits
+            )
+        )
+
+        logits = (
+            top_k_warper(
+                dummy_input_ids,
+                logits
+            )
+        )
+
+        logits = (
+            top_p_warper(
+                dummy_input_ids,
+                logits
+            )
+        )
+
+        probabilities = (
+            torch.softmax(
+                logits,
+                dim=-1
+            )
+        )
+
+        sampled_token_ids = (
+            torch.multinomial(
+                probabilities,
+                num_samples=1
+            )
+        )
+
+        sampled_token_ids = (
+            sampled_token_ids.reshape(
+                batch_size,
+                number_of_quantizers
+            )
+        )
+
+        return sampled_token_ids
+
+    def generate_continuation_inference(
+        self,
+        context_token_ids,
+        number_of_target_tokens,
+        temperature=0.8,
+        top_k=20,
+        top_p=0.9,
+        progress_callback=None
+    ):
+
+        self.eval()
+
+        if (
+            context_token_ids.ndim
+            == 2
+        ):
+
+            context_token_ids = (
+                context_token_ids.unsqueeze(
+                    0
+                )
+            )
+
+        if (
+            context_token_ids.ndim
+            != 3
+        ):
+
+            raise ValueError(
+                "Context token IDs must have shape "
+                "[sequence_length, number_of_quantizers] "
+                "or "
+                "[batch_size, sequence_length, "
+                "number_of_quantizers]."
+            )
+
+        if (
+            context_token_ids.shape[
+                2
+            ]
+            != self.number_of_quantizers
+        ):
+
+            raise ValueError(
+                f"Expected "
+                f"{self.number_of_quantizers} "
+                f"quantizers, but received "
+                f"{context_token_ids.shape[2]}."
+            )
+
+        device = next(
+            self.parameters()
+        ).device
+
+        generated_sequence = (
+            context_token_ids.to(
+                device=device,
+                dtype=torch.long
+            )
+        )
+
+        with torch.no_grad():
+
+            for token_index in range(
+                number_of_target_tokens
+            ):
+
+                logits = (
+                    self(
+                        generated_sequence
+                    )
+                )
+
+                next_token_logits = (
+                    logits[
+                        :,
+                        -1,
+                        :,
+                        :
+                    ]
+                )
+
+                next_token_ids = (
+                    self.sample_inference_tokens(
+                        next_token_logits=(
+                            next_token_logits
+                        ),
+                        temperature=(
+                            temperature
+                        ),
+                        top_k=(
+                            top_k
+                        ),
+                        top_p=(
+                            top_p
+                        )
+                    )
+                )
+
+                next_token_ids = (
+                    next_token_ids.unsqueeze(
+                        1
+                    )
+                )
+
+                generated_sequence = (
+                    torch.cat(
+                        [
+                            generated_sequence,
+                            next_token_ids
+                        ],
+                        dim=1
+                    )
+                )
+
+                if (
+                    progress_callback is not None
+                    and (
+                        token_index % 16 == 0
+                        or token_index
+                        == number_of_target_tokens - 1
+                    )
+                ):
+
+                    progress_callback(
+                        token_index + 1,
+                        number_of_target_tokens
+                    )
 
         generated_target = (
             generated_sequence[
