@@ -22,9 +22,6 @@ warnings.filterwarnings(
 #Config
 FRAMESIZE = 1024
 HOPLENGTH = 512
-N_MELS = 128
-F_MIN = 20
-F_MAX = 8000
 LOUDNESS_THRESHOLD_DB = -55.0
 TARGET_SAMPLE_RATE = 16000
 SOURCE_DURATION_SECONDS = 210
@@ -37,7 +34,6 @@ SUPPORTED_EXTENSIONS = {
     ".wav",
     ".flac"
 }
-EXCLUDED_LABELS = []
 
 #Slakh2100_redux_16k
 SLAKH2100_REDUX_16K_TEST = Path("C:/Uni/YearProject/datasets/slakh2100_redux_16k/test")

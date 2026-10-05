@@ -649,8 +649,7 @@ class DrumContinuationInferencePipeline:
 if __name__ == "__main__":
 
     AUDIO_FILE_PATH = (
-        "test_audio/"
-        "drum_example.wav"
+        "C:/Uni/Advanced_AI/Tyer_KT_222078632_IT18X57_Prototype/src/audio_inputs_for_inference/Drums3.flac"
     )
 
     START_TIME_SECONDS = 0.0
